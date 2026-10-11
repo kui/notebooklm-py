@@ -124,6 +124,15 @@ Bash から `uv run --script tools/audio_jobs.py <コマンド>` として呼ぶ
 - エラーに `unconfirmed=true` がある＝作成されたかどうか不明。空タイトルのため照合できないので、
   `jobs update ... --patch '{"possible_orphan_notebook_at": "<ISO時刻>"}'` で記録し、1回だけやり直す。
   （残るとしてもソースの無い空のノートブックで、利用枠は消費しない。報告で伝える。）
+- エラーコードが `NOTEBOOK_LIMIT`（ノートブック数の上限）→ 自分で選んで消さずに、Bash で
+  `uv run --quiet --script tools/notebook_cleanup.py` を実行する（確認不要）。スクリプトは、自分が所有するノートブックのうち
+  未完了ジョブが使っていないものを `created_at` の古い順に10件削除し、1行の JSON を返す。
+  - `"status": "deleted"` → `deleted` の一覧（id・タイトル）を
+    `jobs update ... --patch '{"deleted_notebooks": <deleted>}' --event "notebook limit cleanup"` で記録する。
+  - `"status": "recently_cleaned"` → 他の実行が直前（5分以内）に掃除済み。何も消していない。
+  - どちらの場合も `notebook_create` を1回だけやり直す。それ以外の status（`error` / `nothing_deleted`）や、
+    やり直しでも `NOTEBOOK_LIMIT` になる場合は、もう一度掃除はせずに下の「それ以外」として扱う。
+  - 削除したノートブックは報告で必ず一覧にする。
 - それ以外、またはやり直しも失敗 → `jobs release <id> --token <t> --error "<エラー内容>"` して、このジョブの処理を終える。
 
 ## B. ソース追加（済んでいるものは追加しない）
@@ -189,5 +198,6 @@ Bash から `uv run --script tools/audio_jobs.py <コマンド>` として呼ぶ
 - 音声概要の形式・長さ・言語
 - 生成の状態: `started`（NotebookLM 側で待機中／作成中）／`waiting_quota`（容量不足で保留。後で「キューを処理して」と頼めば再開）／`failed`（理由）
 - 他の実行に引き継がれたジョブ、空のノートブックが残った可能性（`possible_orphan_notebook_at`）があれば
+- ノートブック上限で古いノートブックを削除した場合は、その一覧（`deleted_notebooks` のタイトルと id）
 - `jobs list` で未完了のジョブが残っていれば、その件数
 - 完成は NotebookLM の画面で確認する旨（ノートブックの Studio パネル）
