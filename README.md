@@ -26,14 +26,20 @@ Chromium が未導入なら先に次を実行する。
 uvx --from "notebooklm-py[mcp,browser]" playwright install chromium
 ```
 
-ログイン情報の期限が切れて MCP のツールが認証エラーを返すようになったら、もう一度 `login` を実行する。
-Chromium のプロファイルに Google のログインが残っていれば、サインインし直さずに認証情報だけ更新される。
-MCP サーバは Cookie が無効になると保存済みの認証情報を読み直すので、通常はこれで復旧する。
-それでも認証エラーが続くときは、共有サーバを再起動する（接続中の各セッションは `/mcp` から `notebooklm` を Reconnect する必要がある）。
+MCP のツールが `unauthenticated` を返すようになったら、ログインし直してから共有サーバを再起動する。
 
 ```bash
+uvx --from "notebooklm-py[mcp,browser]" notebooklm login
 uv run --quiet --script tools/notebooklm_mcp_shared.py --restart-server
 ```
+
+- Chromium のプロファイルに Google のログインが残っていれば、サインインし直さずに認証情報だけ更新される。
+- 本体は起動時に読んだ Cookie をメモリに持ち続け、`login` で書き換わったファイルを読み直さない。
+  そのため `login` だけでは復旧せず、再起動が要る。
+- 本体はセッションを持たない（stateless HTTP）ので、再起動しても接続中のセッションはそのまま使える（Reconnect 不要）。
+- 本体の Cookie ローテーション（`RotateCookies`）が 200 を返していても、Google 側でセッションが無効になることがある（原因は未特定）。
+
+確認は `uvx --from "notebooklm-py[mcp]" notebooklm auth check --test --passive`（Cookie の更新や書き込みをしない）。
 
 ### 2. Claude Code を起動する
 
@@ -49,6 +55,7 @@ Claude Code は stdio の MCP サーバをセッションごとに起動する�
 
 - 最初のセッションが接続したときに本体を起動し、最後のセッションが終わって30秒経つと止める（常駐しない）。
 - 各セッションのラッパーは [mcp-proxy](https://pypi.org/project/mcp-proxy/) で stdio と HTTP を中継するだけで、Google とは通信しない。
+- 本体は `FASTMCP_STATELESS_HTTP=true` で起動する（MCP のセッションを持たない）。ツールはどれも呼び出しごとに完結するので失うものはなく、本体を再起動してもクライアントは切れない。
 - 状態とログは `~/.notebooklm/shared-mcp/`（`shim.log`、`server.log`）。
 
 ```bash

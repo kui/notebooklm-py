@@ -64,6 +64,10 @@ SERVER_CMD = [
     "--port",
     str(PORT),
 ]
+# ツールはどれも呼び出しごとに完結するので、MCP のセッションを持たせない。
+# セッションがあると本体の再起動（認証の読み直し）で古いセッション ID が拒否され、
+# 接続中の全クライアントが "Session terminated" になって手動の再接続が要る。
+SERVER_ENV = {**os.environ, "FASTMCP_STATELESS_HTTP": "true"}
 PROXY_CMD = [
     "uvx",
     "mcp-proxy@0.13.0",
@@ -209,10 +213,17 @@ def kill_tree(pid: int) -> None:
                 p.kill()
 
 
-def detached_popen(cmd: list[str], stdout_path: Path) -> subprocess.Popen:
+def detached_popen(
+    cmd: list[str], stdout_path: Path, env: dict[str, str] | None = None
+) -> subprocess.Popen:
     """呼び出し元（Claude Code のプロセスツリー）から切り離して起動する。"""
     out = open(stdout_path, "ab")  # noqa: SIM115 - 子プロセスに渡す
-    kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": out, "stderr": subprocess.STDOUT}
+    kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": out,
+        "stderr": subprocess.STDOUT,
+        "env": env,
+    }
     if IS_WINDOWS:
         base = (
             subprocess.DETACHED_PROCESS
@@ -287,7 +298,7 @@ def start_server() -> int:
         with contextlib.suppress(OSError):
             if path.stat().st_size > LOG_MAX_BYTES:
                 os.replace(path, path.with_suffix(".log.old"))
-    proc = detached_popen(SERVER_CMD, SERVER_LOG)
+    proc = detached_popen(SERVER_CMD, SERVER_LOG, env=SERVER_ENV)
     log(f"started server pid={proc.pid}")
     return proc.pid
 

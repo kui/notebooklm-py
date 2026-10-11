@@ -24,6 +24,18 @@ URLだけが渡されたら、確認せずに既定値でそのまま最後ま�
 - **このスキルは複数のセッションで同時に実行されうる。** 進み具合は必ず下の「ジョブ台帳」に記録し、
   NotebookLM を操作する前に「もう済んでいないか」を確認してから操作する（やり直しても二重に作らない）。
 
+## 認証エラー（`unauthenticated`）からの復旧
+
+どの手順でもツールが `unauthenticated` を返したら、ユーザーに頼まずに自分で次を行い、1回だけ復旧を試みる。
+
+1. ターミナルで `uvx --from "notebooklm-py[mcp,browser]" notebooklm login` を実行する（`[mcp]` だけでは Playwright 不足で失敗する）。
+   ブラウザのプロファイルにログインが残っていれば操作なしで終わる。サインインを求められたらユーザーに頼む（パスワードは入力しない）。
+2. Bash で `uv run --quiet --script tools/notebooklm_mcp_shared.py --restart-server` を実行し、`--status` が `"listening": true` になるまで待つ。
+   本体は起動時の Cookie を持ち続けるので、ログインだけでは直らない。本体はセッションを持たないので、再起動しても Reconnect は不要。
+3. `notebook_list` で復旧を確かめ、ジョブを今の state から再開する（作成系がエラーで結果不明だったなら、各手順の「済んでいるか」の確認から入る）。
+
+復旧しなければ、ジョブを `jobs release ... --error "unauthenticated"` で外し、試したことを報告する。
+
 ## ジョブ台帳
 
 `tools/audio_jobs.py` が1ジョブ1ファイル（`jobs/<job_id>.json`）で進み具合を記録する。作業ディレクトリで

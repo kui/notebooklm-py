@@ -293,6 +293,8 @@ def parse_json_arg(value: str | None) -> dict:
 
 
 def main(argv: list[str]) -> int:
+    # Windows の既定（cp932）だと日本語が化けるので、出力は常に UTF-8 にする。
+    sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(prog="audio_jobs")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("new")
