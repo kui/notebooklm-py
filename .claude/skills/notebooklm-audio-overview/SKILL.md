@@ -182,6 +182,10 @@ Bash から `uv run --script tools/audio_jobs.py <コマンド>` として呼ぶ
      `jobs update ... --patch '{"state": "started", "task_id": "<task_id>"}'`。ポーリングしない。
      この時点で `failed` なら下の容量不足／その他の失敗として扱う。
    - **容量不足**: エラーが `RATE_LIMITED`、または `status` が `failed` でエラー文が利用上限・クォータ・rate limit を示す。
+     `RATE_LIMITED` は `commit_state: "rejected"` でも実際には受け付けられていることがあるので、まず
+     `studio_list(notebook=id, kind="audio", detail="compact")` を1回だけ呼ぶ。`pending` / `in_progress` / `completed` があれば
+     `jobs update ... --patch '{"state": "started", "task_id": "<その id>"}' --event "accepted despite RATE_LIMITED"` で開始扱いにする
+     （以降のジョブの生成も通常どおり試す）。無ければ
      → `jobs release ... --patch '{"state": "waiting_quota"}' --event "<エラー要約>"`。以降のジョブも生成は試さない。
    - **結果不明**（`unconfirmed=true`、タイムアウト、`retriable=true` のエラー）: 依頼が通っている可能性がある。
      **そのまま作り直さず**、1. の `studio_list` から1回だけやり直す（通っていれば `started` になり、通っていなければ改めて依頼する）。
