@@ -225,11 +225,10 @@ def detached_popen(
         "env": env,
     }
     if IS_WINDOWS:
-        base = (
-            subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.CREATE_NO_WINDOW
-        )
+        # DETACHED_PROCESS と組み合わせると CREATE_NO_WINDOW は無視され、子の uv.exe などが
+        # 見えるコンソールウィンドウを新しく作ってしまう。非表示のコンソールを持たせて
+        # 子孫にもそれを引き継がせる。
+        base = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         try:
             return subprocess.Popen(
                 cmd, creationflags=base | subprocess.CREATE_BREAKAWAY_FROM_JOB, **kwargs
