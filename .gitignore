@@ -1,0 +1,13 @@
+# ダウンロードした音声などの成果物
+downloads/*
+!downloads/.gitkeep
+*.mp3
+*.mp4
+*.m4a
+*.wav
+
+# ローカル設定・認証情報
+.claude/settings.local.json
+.notebooklm/
+storage_state.json
+.env
