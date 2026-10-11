@@ -1,6 +1,7 @@
-# ダウンロードした音声などの成果物
-downloads/*
-!downloads/.gitkeep
+# 音声概要のローカルキュー
+queue/
+
+# 音声ファイル
 *.mp3
 *.mp4
 *.m4a
