@@ -1,6 +1,7 @@
 ---
 name: notebooklm-audio-overview
 description: 渡されたURL・YouTubeリンク・文章をソースにNotebookLMのノートブックを新規作成し、音声概要（ポッドキャスト風Audio Overview）を生成する。「このURLで音声概要を作って」「この記事をNotebookLMでポッドキャストにして」「この文章から音声解説を作成」などのリクエストで使用する。
+argument-hint: <URL・YouTubeリンク・文章（複数可）> [追加の指示]
 ---
 
 # NotebookLM 音声概要作成
@@ -10,13 +11,19 @@ description: 渡されたURL・YouTubeリンク・文章をソースにNotebookL
 `select:mcp__notebooklm__notebook_create,mcp__notebooklm__source_add,mcp__notebooklm__source_wait,mcp__notebooklm__studio_generate,mcp__notebooklm__studio_status,mcp__notebooklm__studio_download`
 をまとめて読み込む。
 
+入力: $ARGUMENTS
+
+（スラッシュコマンドで起動された場合は上の入力を、会話から起動された場合はユーザーの発言をソースとして扱う。
+URLだけが渡されたら、確認せずに既定値でそのまま最後まで進める。）
+
 ## 1. 入力の整理
 
-ユーザーの入力からソースを分類する。
+入力からソースを分類する。
 
 - `https://www.youtube.com/...` / `https://youtu.be/...` → `youtube`
 - その他の `http(s)://` → `url`
 - それ以外の地の文 → `text`（まとまり単位で1ソース。複数の文章があれば別ソースにする）
+  - ただし「初心者向けに」「〜を中心に」のような生成への要望は、ソースではなく追加の指示として扱う。
 
 オプション（指定がなければ既定値、確認のために止まらない）:
 
@@ -24,10 +31,19 @@ description: 渡されたURL・YouTubeリンク・文章をソースにNotebookL
 |---|---|---|
 | ノートブック名 | 内容から短く自動命名（例: `音声概要: <主題>`） | 任意 |
 | 形式 `audio_format` | `deep-dive` | deep-dive / brief / critique / debate |
-| 長さ `audio_length` | `default` | short / default / long |
+| 長さ `audio_length` | `long` | short / default / long |
 | 言語 `language` | `ja` | ユーザーが他言語を指定した場合のみ変更 |
-| 指示 `instructions` | なし | 「初心者向けに」等、ユーザーの要望があれば渡す |
+| 指示 `instructions` | 下の既定プロンプト | ユーザーの要望があれば既定プロンプトの末尾に追記する。聞き手を変える指定（例:「経営層向けに」）なら1行目を置き換える |
 | ダウンロード | する（`downloads/` に保存） | ユーザーが不要と言えばしない |
+
+既定プロンプト（`instructions`）:
+
+```
+聞き手はITエンジニアを想定してください。
+一般的なIT用語や基礎概念の説明は省き、技術的な仕組み、設計上の判断とトレードオフ、既存技術との違い、実務での使いどころや注意点を深掘りしてください。
+具体的な数値・事例・コード上の要点がソースにあれば積極的に取り上げてください。
+ソースに書かれていない推測や意見を述べるときは、そうと分かるように話してください。
+```
 
 ## 2. ノートブック作成
 
