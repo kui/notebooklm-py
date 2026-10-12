@@ -22,7 +22,8 @@ URLだけが渡されたら、確認せずに既定値でそのまま最後ま�
 - 各工程の前に「もう済んでいないか」を確かめるので、何度実行しても二重には作らない。複数のセッションから同時に実行してよい。
 - 容量不足ならジョブを `waiting_quota` で残し、同じ実行の残りのジョブも生成は試さない。
 - ノートブック数の上限に当たったら、古いノートブックを10件削除して作り直す（`tools/notebook_cleanup.py`）。
-- 認証切れ（`AUTH`、または `UNEXPECTED` で `server.log` に `CSRF token not found`）は、
+- 認証切れ（`AUTH`、本文に `unauthenticated` を含むエラー（`RPC` で `rpc_code=16` のときなど）、
+  または `UNEXPECTED` で `server.log` に `CSRF token not found`）は、
   `notebooklm login` と共有サーバの再起動で1回だけ自動復旧を試みる。
 
 ## 1. 入力の解釈

@@ -126,6 +126,17 @@ class ToolErr(Exception):
         """依頼が通ったかどうか分からない失敗。"""
         return self.unconfirmed or self.retriable or self.code in {"TIMEOUT", "NETWORK"}
 
+    @property
+    def is_auth(self) -> bool:
+        """認証切れ。形は3通りある:
+        - コード AUTH
+        - コード RPC で本文に "(unauthenticated)"（RPC の中身が rpc_code=16。HTTP は 200 なのでライブラリの自動更新が動かない）
+        - コード UNEXPECTED で server.log に CSRF token not found（未ログイン用ページが返った）
+        """
+        if self.code == "AUTH" or "unauthenticated" in self.text.lower():
+            return True
+        return self.code == "UNEXPECTED" and csrf_failure_logged()
+
 
 class AuthFailed(Exception):
     pass
@@ -196,9 +207,10 @@ class NotebookLM:
         try:
             return await self._call_once(name, args, timeout)
         except ToolErr as e:
-            if not (e.code == "AUTH" or (e.code == "UNEXPECTED" and csrf_failure_logged())):
+            if not e.is_auth:
                 raise
-            # 認証エラーはクライアントを開く前か RPC が拒否された段階で起きるので、依頼は通っていない。
+            # 認証エラーはクライアントを開く前か RPC が拒否された段階で起きるので、依頼は通っていない
+            # （unconfirmed=true が付いていても、サーバが unauthenticated で拒否しているので作られていない）。
             if self.auth_recovered:
                 raise AuthFailed(str(e)) from e
             self.auth_recovered = True
@@ -209,7 +221,7 @@ class NotebookLM:
             try:
                 return await self._call_once(name, args, timeout)
             except ToolErr as e2:
-                if e2.code == "AUTH" or (e2.code == "UNEXPECTED" and csrf_failure_logged()):
+                if e2.is_auth:
                     raise AuthFailed(str(e2)) from e2
                 raise
 
