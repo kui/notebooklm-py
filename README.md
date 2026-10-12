@@ -99,6 +99,14 @@ URL・YouTube リンク・文章を渡すと、ノートブックを作成して
 
 ノートブック名は付けずに作成し、NotebookLM がソースの内容から自動で命名する。
 
+工程はすべて [tools/audio_overview.py](tools/audio_overview.py) が行い、スキル（エージェント）は入力の解釈と結果の報告だけを受け持つ。
+スクリプトは共有 MCP サーバのラッパーに stdio で接続するので、Claude Code を使わずに直接実行してもよい。
+
+```bash
+uv run --quiet --script tools/audio_overview.py --spec '{"sources": [{"type": "url", "url": "https://example.com/article"}]}'
+uv run --quiet --script tools/audio_overview.py   # 残っているジョブだけを処理する
+```
+
 音声概要の生成は NotebookLM の利用枠を消費する。枠が足りないときはジョブを保留にし、
 次回スキルを使ったとき、または「音声概要のキューを処理して」と頼んだときに古い順に再開する。
 
