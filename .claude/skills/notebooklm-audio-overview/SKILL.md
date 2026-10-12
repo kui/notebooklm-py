@@ -27,6 +27,13 @@ URLだけが渡されたら、確認せずに既定値でそのまま最後ま�
 ## 認証エラー（`unauthenticated`）からの復旧
 
 どの手順でもツールが `unauthenticated` を返したら、ユーザーに頼まずに自分で次を行い、1回だけ復旧を試みる。
+（共有サーバは起動時に認証を確かめて自動でログインし直すので、これが要るのは使っている途中で切れたときだけ。）
+
+`UNEXPECTED: An unexpected internal error occurred` が返ったときも、認証切れのことがある。`~/.notebooklm/shared-mcp/server.log` の
+末尾を見て、`CSRF token not found in HTML. Final URL: https://notebook.google.com/` が出ていれば認証切れとして同じ手順を行う。
+（Cookie が切れると NotebookLM はログイン画面へリダイレクトせず、未ログイン用のページを 200 で返す。ライブラリはこれを
+「ページ構造の変更」と分類するので、自動復旧も動かず、エラーも `unauthenticated` ではなく `UNEXPECTED` になる。
+クライアントを開く前に失敗しているので、作成系の操作も通っていない。2026-10-12 に確認。）
 
 1. ターミナルで `uvx --from "notebooklm-py[mcp,browser]" notebooklm login` を実行する（`[mcp]` だけでは Playwright 不足で失敗する）。
    ブラウザのプロファイルにログインが残っていれば操作なしで終わる。サインインを求められたらユーザーに頼む（パスワードは入力しない）。

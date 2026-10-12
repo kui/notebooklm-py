@@ -64,6 +64,22 @@ SERVER_CMD = [
     "--port",
     str(PORT),
 ]
+AUTH_CHECK_CMD = ["uvx", "--from", "notebooklm-py[mcp]", "notebooklm", "auth", "check", "--test"]
+# 本体の起動前に行うので、クライアントの待ち時間（SERVER_READY_TIMEOUT）に収める。
+AUTH_CHECK_TIMEOUT = 15.0
+# ブラウザプロファイルにログインが残っていれば操作なしで終わる。残っていなければ
+# サインイン画面が開いたまま LOGIN_BROWSER_TIMEOUT 秒待つ。Playwright が要るので [browser] も入れる。
+LOGIN_BROWSER_TIMEOUT = 120
+LOGIN_CMD = [
+    "uvx",
+    "--from",
+    "notebooklm-py[mcp,browser]",
+    "notebooklm",
+    "login",
+    "--browser-timeout",
+    str(LOGIN_BROWSER_TIMEOUT),
+]
+LOGIN_TIMEOUT = LOGIN_BROWSER_TIMEOUT + 60.0
 # ツールはどれも呼び出しごとに完結するので、MCP のセッションを持たせない。
 # セッションがあると本体の再起動（認証の読み直し）で古いセッション ID が拒否され、
 # 接続中の全クライアントが "Session terminated" になって手動の再接続が要る。
@@ -302,8 +318,32 @@ def start_server() -> int:
     return proc.pid
 
 
+def run_logged(cmd: list[str], timeout: float) -> bool:
+    """コマンドを非表示で実行し、出力を shim.log に残す。終了コード 0 なら True。"""
+    kwargs: dict = {"stdin": subprocess.DEVNULL, "capture_output": True, "timeout": timeout}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    name = " ".join(cmd[3:6])
+    try:
+        proc = subprocess.run(cmd, **kwargs)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"{name} failed: {e!r}")
+        return False
+    tail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()[-300:]
+    log(f"{name} exit={proc.returncode}: {tail!r}")
+    return proc.returncode == 0
+
+
+def auth_ok() -> bool:
+    """保存済み Cookie で NotebookLM のトークンが取れるか確かめる（必要なら Cookie の更新も行う）。"""
+    return run_logged(AUTH_CHECK_CMD, AUTH_CHECK_TIMEOUT)
+
+
 def supervise() -> int:
     me = psutil.Process()
+    # 本体が止まっている間（PC の停止中など）は Cookie の更新が走らないので、
+    # 起動のたびに確かめる。本体の起動前に済ませ、古い Cookie を読ませない。
+    authed = auth_ok()
     with global_lock():
         info = read_json(SUPERVISOR_PATH)
         if info and "pending_since" not in info and supervisor_alive():
@@ -314,6 +354,24 @@ def supervise() -> int:
             SUPERVISOR_PATH,
             {"pid": me.pid, "create_time": me.create_time(), "server_pid": server_pid},
         )
+    if not authed:
+        # Cookie が切れても NotebookLM はログイン画面へリダイレクトせず、未ログイン用のページを
+        # 返すことがある。ライブラリはこれを認証切れと判定しないので、自動復旧は動かない。
+        # ブラウザプロファイルのログインは Cookie より長く持つので、そこから取り直す。
+        # 時間がかかるので、MCP の接続を待たせないよう本体の起動後に行う。
+        log("auth check failed; running notebooklm login")
+        if run_logged(LOGIN_CMD, LOGIN_TIMEOUT):
+            with global_lock():
+                kill_tree(server_pid)
+                # 止めた本体がまだポートを握っていると start_server がそれを引き継いでしまう。
+                deadline = time.monotonic() + 5
+                while port_listening() and time.monotonic() < deadline:
+                    time.sleep(0.2)
+                server_pid = start_server()
+                info = read_json(SUPERVISOR_PATH) or {}
+                info["server_pid"] = server_pid
+                write_json_atomic(SUPERVISOR_PATH, info)
+            log("restarted server after login")
     server_ct = psutil.Process(server_pid).create_time() if psutil.pid_exists(server_pid) else None
     last_start = time.monotonic()
     idle_since: float | None = None

@@ -26,7 +26,9 @@ Chromium が未導入なら先に次を実行する。
 uvx --from "notebooklm-py[mcp,browser]" playwright install chromium
 ```
 
-MCP のツールが `unauthenticated` を返すようになったら、ログインし直してから共有サーバを再起動する。
+共有サーバは起動のたびに認証を確かめ、切れていれば `notebooklm login` を自動で実行してから本体を起動し直す（下の「MCP サーバの共有」）。
+使っている途中で切れて、MCP のツールが `unauthenticated` を返すようになったら（`UNEXPECTED` を返し、`server.log` に
+`CSRF token not found` が出ている場合も同じ）、ログインし直してから共有サーバを再起動する。
 
 ```bash
 uvx --from "notebooklm-py[mcp,browser]" notebooklm login
@@ -56,6 +58,11 @@ Claude Code は stdio の MCP サーバをセッションごとに起動する�
 - 最初のセッションが接続したときに本体を起動し、最後のセッションが終わって30秒経つと止める（常駐しない）。
 - 各セッションのラッパーは [mcp-proxy](https://pypi.org/project/mcp-proxy/) で stdio と HTTP を中継するだけで、Google とは通信しない。
 - 本体は `FASTMCP_STATELESS_HTTP=true` で起動する（MCP のセッションを持たない）。ツールはどれも呼び出しごとに完結するので失うものはなく、本体を再起動してもクライアントは切れない。
+- 本体を起動する前に `notebooklm auth check --test` で認証を確かめる。本体が止まっている間（PC の停止中など）は Cookie の更新が走らず、
+  切れていることがあるため。失敗したら本体を先に起動してから（MCP の接続を待たせないため）`notebooklm login` を実行し、成功したら本体を起動し直す。
+  Chromium のプロファイルに Google のログインが残っていれば操作なしで10秒ほどで終わる。残っていなければサインイン画面が開き、120秒待つ。
+  Cookie が切れても NotebookLM はログイン画面へリダイレクトせず未ログイン用のページを返すことがあり、ライブラリ（0.8.4）はこれを
+  認証切れと判定しないため、ライブラリ自身の自動復旧（`NOTEBOOKLM_HEADLESS_REAUTH` など）は効かない。
 - 状態とログは `~/.notebooklm/shared-mcp/`（`shim.log`、`server.log`）。
 
 ```bash
