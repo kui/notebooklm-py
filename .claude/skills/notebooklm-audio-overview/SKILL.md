@@ -64,7 +64,8 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
 出力は stdout に1行の JSON（stderr は進み具合）:
 
 - `jobs`: 処理したジョブごとの結果。主なキー:
-  `job_id` / `outcome` / `state` / `notebook_id` / `notebook_title` / `source_report` / `task_id` / `audio` / `error`、
+  `job_id` / `outcome` / `state` / `notebook_id` / `notebook_url` / `notebook_title` / `source_report` / `task_id` / `audio` / `error`、
+  （`notebook_url` はノートブックが作成済みなら、生成の成否にかかわらず入る）
   あれば `possible_orphan_notebook_at` / `previous_create_unconfirmed` / `deleted_notebooks`
 - `outcome`: `started`（生成開始を確認）/ `waiting_quota`（容量不足で保留）/ `failed`（打ち切り）/
   `error`（今回は失敗。3回目で `failed` になる）/ `lease_lost`（他の実行が引き継いだ）/ `not_processed`（接続できず未着手）
@@ -88,3 +89,11 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
 - ノートブック上限で古いノートブックを削除した場合は、その一覧（`deleted_notebooks` のタイトルと id）
 - `open_jobs` が1以上なら、その件数
 - 完成は NotebookLM の画面で確認する旨（ノートブックの Studio パネル）
+
+報告の最後に、`notebook_url` があるジョブすべてについて、ノートブックの URL を1行ずつ出す
+（生成が `started` 以外でも出す。`notebook_url` が無いジョブ＝ノートブック未作成のものは出さない）:
+
+```
+ノートブック: <notebook_title>
+<notebook_url>
+```

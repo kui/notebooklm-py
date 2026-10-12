@@ -62,6 +62,15 @@ from notebooklm.outcomes import CommitState
 from notebooklm.types import Artifact, ArtifactType, AudioFormat, AudioLength, Source, SourceType
 
 try:
+    # NOTEBOOKLM_BASE_URL を反映した NotebookLM の URL。非公開モジュールなので無ければ既定のホストを使う。
+    from notebooklm._env import get_base_url
+except ImportError:  # pragma: no cover
+
+    def get_base_url() -> str:
+        return "https://notebook.google.com"
+
+
+try:
     # 本文が薄いソースの判定（MCP の source_wait が付ける warning と同じもの）。非公開モジュールなので無ければ省く。
     from notebooklm._app.content_sanity import text_content_warning
 except ImportError:  # pragma: no cover
@@ -110,6 +119,10 @@ def progress(msg: str) -> None:
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def notebook_url(notebook_id: str) -> str:
+    return f"{get_base_url()}/notebook/{notebook_id}"
 
 
 def build_options(options: dict) -> dict:
@@ -271,6 +284,8 @@ class Runner:
             outcome=outcome,
             state=final.get("state"),
             notebook_id=final.get("notebook_id"),
+            # ノートブックができていれば、生成の成否にかかわらず開けるように URL を返す。
+            notebook_url=notebook_url(final["notebook_id"]) if final.get("notebook_id") else None,
             notebook_title=final.get("notebook_title"),
             source_report=final.get("source_report"),
             task_id=final.get("task_id"),
