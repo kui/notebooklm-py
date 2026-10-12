@@ -40,7 +40,7 @@ import subprocess
 import sys
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -106,6 +106,9 @@ DEFAULT_INSTRUCTIONS = [
     "ソースに書かれていない推測や意見を述べるときは、そうと分かるように話してください。",
 ]
 ACTIVE = {"pending", "in_progress", "completed"}
+# 生成を始めた後に失敗した回数がこれに達したら、再試行をやめて failed にする。
+MAX_GENERATION_FAILURES = 3
+RATE_LIMITED_RE = re.compile(r"RATE_?LIMIT|RateLimit", re.I)
 # 生成が failed になったときのエラー文にだけ使うので、広めに拾う。
 QUOTA_RE = re.compile(r"quota|limit|上限|exhaust", re.I)
 YOUTUBE_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([\w-]{11})")
@@ -261,6 +264,8 @@ class Runner:
     def __init__(self, nlm: NotebookLM):
         self.nlm = nlm
         self.quota_blocked = False
+        # ノートブック数の上限で、消せるノートブック（聞き終えたもの等）が無かった。
+        self.slot_blocked = False
 
     async def process(self, job_id: str, token: str, job: dict) -> dict:
         self.job_id, self.token, self.job = job_id, token, job
@@ -291,7 +296,7 @@ class Runner:
             task_id=final.get("task_id"),
             audio={k: self.opts[k] for k in ("audio_format", "audio_length", "language")},
         )
-        for key in ("possible_orphan_notebook_at", "deleted_notebooks", "error_count", "last_error"):
+        for key in ("possible_orphan_notebook_at", "deleted_notebooks", "error_count", "last_error", "generation_failures"):
             if final.get(key):
                 self.report[key] = final[key]
         progress(f"job {job_id}: {outcome} (state={final.get('state')})")
@@ -324,7 +329,7 @@ class Runner:
     async def _run(self) -> str:
         while True:
             state = self.job.get("state")
-            if state in ("new", "creating_notebook"):
+            if state in ("new", "creating_notebook", "waiting_notebook_slot"):
                 step = self.step_a
             elif state == "notebook_created":
                 step = self.step_b
@@ -346,6 +351,8 @@ class Runner:
         if self.job.get("state") == "creating_notebook":
             # 前回の作成が通っていた可能性がある（空タイトルなので照合できない）。
             self.report["previous_create_unconfirmed"] = True
+        if self.slot_blocked:
+            return self._waiting_slot("no deletable notebook earlier in this run")
         self._update({"state": "creating_notebook"})
         title = self.opts["title"]
         retried_unconfirmed = cleaned = False
@@ -361,6 +368,13 @@ class Runner:
                 result = await notebook_cleanup.run_with(self.nlm.do, 10, False)
                 if result.get("status") == "deleted":
                     self._update({"deleted_notebooks": result["deleted"]}, "notebook limit cleanup")
+                elif result.get("status") == "nothing_deletable":
+                    # 残りはどれも未再生などで消せない。聞き終えれば空くので、失敗にせず待つ。
+                    self.slot_blocked = True
+                    return self._waiting_slot(
+                        "notebook limit; nothing deletable "
+                        + json.dumps(result.get("playback_counts"), ensure_ascii=False)
+                    )
                 elif result.get("status") != "recently_cleaned":
                     return self._fail(f"{error_text(e)} / cleanup: {json.dumps(result, ensure_ascii=False)}")
             except NotebookLMError as e:
@@ -499,6 +513,10 @@ class Runner:
         self._update({"state": "waiting_quota"}, event, release=True)
         return "waiting_quota"
 
+    def _waiting_slot(self, event: str) -> str:
+        self._update({"state": "waiting_notebook_slot"}, event, release=True)
+        return "waiting_notebook_slot"
+
     async def step_d(self) -> str | None:
         if self.quota_blocked:
             self._update({"state": "waiting_quota"}, "quota exhausted earlier in this run", release=True)
@@ -550,6 +568,77 @@ class Runner:
         return self._fail("generate result unconfirmed twice")
 
 
+# --- 生成を始めたジョブの結果確認 ------------------------------------------------------
+
+
+def rate_limited_start(job: dict) -> bool:
+    """最後の生成開始が、容量制限の応答なのに受け付けられていたもの（step_d の記録）か。"""
+    for entry in reversed(job.get("history", [])):
+        # started に変わった記録だけを見る（check_started が後から付ける記録は state が変わらないので from が無い）。
+        if entry.get("state") == "started" and entry.get("from"):
+            return bool(RATE_LIMITED_RE.search(entry.get("event") or ""))
+    return False
+
+
+async def check_started(nlm: NotebookLM) -> list[dict]:
+    """生成を始めた（started）が完成を確かめていないジョブについて、音声概要の結果を見に行く。
+
+    - 完成していれば audio_status=completed を記録し、以後は見ない。
+    - 失敗していれば waiting_quota に戻す（この後の処理で step_d が retry_failed で再試行する）。
+      容量制限の応答で受け付けられた生成が後から失敗することがあり、時間を置けば通ることが多い。
+      MAX_GENERATION_FAILURES 回失敗したら failed で打ち切る。
+    - 生成中なら何もしない。音声概要が無ければ audio_status=deleted、ノートブックが消えていれば
+      audio_status=notebook_missing を記録する（どちらも作り直さない）。
+    """
+    with jobs.store_lock():
+        targets = [
+            j for j in jobs.all_jobs()
+            if j.get("state") == "started" and j.get("notebook_id") and not j.get("audio_status")
+        ]
+    if not targets:
+        return []
+    progress(f"checking {len(targets)} started job(s)")
+    owned = {nb.id for nb in await nlm.do(lambda c: c.notebooks.list())}
+    out = []
+    for job in targets:
+        nb = job["notebook_id"]
+        if nb not in owned:
+            patch, event, result = {"audio_status": "notebook_missing"}, "notebook not found", "notebook_missing"
+        else:
+            items = await nlm.do(lambda c, nb=nb: c.artifacts.list(nb, ArtifactType.AUDIO))
+            if any(a.is_completed for a in items):
+                patch, event, result = {"audio_status": "completed"}, "audio completed", "completed"
+            elif any(a.is_processing or a.is_pending for a in items):
+                continue  # 生成中。次回また見る。
+            elif not items:
+                # 始めた直後は一覧への反映が遅れることがある。時間が経っても無ければ画面で削除されたので、作り直さない。
+                if datetime.now(UTC) - datetime.fromisoformat(job["updated_at"]) < timedelta(minutes=10):
+                    continue
+                patch, event, result = {"audio_status": "deleted"}, "audio not found", "deleted"
+            elif rate_limited_start(job):
+                # 容量制限の応答で受け付けられた生成は、容量が戻るまで失敗する。ソースの問題ではないので回数に数えない。
+                patch, result = {"state": "waiting_quota"}, "retry"
+                event = "audio generation failed after rate-limited start (not counted)"
+            else:
+                failures = job.get("generation_failures", 0) + 1
+                if failures >= MAX_GENERATION_FAILURES:
+                    patch = {"state": "failed", "generation_failures": failures, "last_error": "audio generation failed"}
+                    result = "failed"
+                else:
+                    patch = {"state": "waiting_quota", "generation_failures": failures}
+                    result = "retry"
+                event = f"audio generation failed ({failures}/{MAX_GENERATION_FAILURES})"
+        res = jobs.cmd_annotate(job["id"], job["updated_at"], patch, event)
+        if res["updated"]:
+            out.append({
+                "job_id": job["id"],
+                "notebook_title": job.get("notebook_title"),
+                "notebook_url": notebook_url(nb),
+                "result": result,
+            })
+    return out
+
+
 # --- エントリポイント -----------------------------------------------------------------
 
 
@@ -560,9 +649,16 @@ async def run(spec: dict | None) -> dict:
         new = jobs.cmd_new({**spec, "options": build_options(spec.get("options", {}))})
         progress(f"created job {new['job_id']}")
     results: list[dict] = []
+    checked: list[dict] = []
     fatal = None
     nlm = NotebookLM()
     try:
+        # 失敗していた生成は waiting_quota に戻るので、この後の claim で再試行される。
+        try:
+            checked = await check_started(nlm)
+        except NotebookLMError as e:
+            # 確認できなくても、残りのジョブの処理は進める（次回また確認する）。
+            checked = [{"error": error_text(e)}]
         runner = Runner(nlm)
         handled: set[str] = {new["job_id"]} if new else set()
         while True:
@@ -588,7 +684,7 @@ async def run(spec: dict | None) -> dict:
             pass
         results.append({"job_id": new["job_id"], "outcome": "not_processed", "state": "new"})
     open_jobs = jobs.cmd_list(False)["jobs"]
-    return {"jobs": results, "fatal": fatal, "open_jobs": len(open_jobs)}
+    return {"checked": checked, "jobs": results, "fatal": fatal, "open_jobs": len(open_jobs)}
 
 
 def main(argv: list[str]) -> int:

@@ -9,7 +9,10 @@
 
 - 自分が所有するノートブック（is_owner が true）だけを対象にする（共有されただけのものは消さない）。
 - 未完了ジョブ（jobs/*.json で state が started / failed 以外）が使っている notebook_id は除く。
-- 残りを created_at の古い順に並べ、先頭から --count 件（既定 10）を削除する。
+- 残りの再生状況を audio_playback.py で調べ、音声概要を聞き終えたもの（played）→ 完成した音声概要が
+  無いもの（no_audio）→ 生成に失敗したもの（failed）の順に、それぞれ created_at の古い順に並べ、先頭から --count 件（既定 10）を削除する。
+- 未再生・途中まで再生・生成中・状況を取れなかったノートブックは消さない。消せるものが1件も無ければ
+  {"status": "nothing_deletable"} を返す。
 
 同時実行への備え:
 - jobs/.cleanup.lock のプロセス間ロックの中で、一覧の取得から削除までを行う。
@@ -41,7 +44,8 @@ from typing import Any
 
 from notebooklm import NotebookLMClient
 from notebooklm.exceptions import NotebookLMError
-from notebooklm.types import Notebook
+
+import audio_playback
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -96,7 +100,7 @@ def cleanup_lock() -> Iterator[None]:
 
 
 def protected_notebook_ids() -> set[str]:
-    """未完了ジョブが使っている notebook_id。"""
+    """未完了ジョブと、生成の結果をまだ確かめていない started のジョブ（失敗なら再試行する）が使っている notebook_id。"""
     ids = set()
     for path in JOBS_DIR.glob("*.json"):
         if path.name.startswith("."):
@@ -105,7 +109,8 @@ def protected_notebook_ids() -> set[str]:
             job = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if job.get("state") not in TERMINAL and job.get("notebook_id"):
+        unchecked = job.get("state") == "started" and not job.get("audio_status")
+        if (job.get("state") not in TERMINAL or unchecked) and job.get("notebook_id"):
             ids.add(job["notebook_id"])
     return ids
 
@@ -130,9 +135,13 @@ def record_cleanup(deleted: list[dict]) -> None:
     os.replace(tmp, STATE_PATH)
 
 
-def pick(notebooks: list[Notebook], protected: set[str], count: int) -> list[Notebook]:
-    candidates = [nb for nb in notebooks if nb.is_owner and nb.id not in protected and nb.created_at]
-    candidates.sort(key=lambda nb: nb.created_at)
+def pick(entries: list[dict], protected: set[str], count: int) -> list[dict]:
+    """audio_playback.report_for() の結果から削除するものを選ぶ。聞き終えたもの → 音声の無いもの → 生成に失敗したもの、各々古い順。"""
+    candidates = [
+        e for e in entries if e["status"] in audio_playback.DELETABLE and e["notebook_id"] not in protected and e["created_at"]
+    ]
+    order = {"played": 0, "no_audio": 1, "failed": 2}
+    candidates.sort(key=lambda e: (order[e["status"]], e["created_at"]))
     return candidates[:count]
 
 
@@ -153,13 +162,21 @@ async def run_with(do: Do, count: int, dry_run: bool) -> dict:
 
         notebooks = await do(lambda c: c.notebooks.list())
         protected = protected_notebook_ids()
-        targets = pick(notebooks, protected, count)
+        entries = await audio_playback.report_for(do, [nb for nb in notebooks if nb.id not in protected])
+        targets = pick(entries, protected, count)
         summary = [
-            {"id": nb.id, "title": nb.title, "created_at": nb.created_at.isoformat()} for nb in targets
+            {"id": e["notebook_id"], "title": e["title"], "created_at": e["created_at"], "playback": e["status"]}
+            for e in targets
         ]
-        base = {"total_notebooks": len(notebooks), "protected": sorted(protected)}
+        base = {
+            "total_notebooks": len(notebooks),
+            "protected": sorted(protected),
+            "playback_counts": audio_playback.summarize(entries),
+        }
         if dry_run:
             return {"status": "dry_run", **base, "would_delete": summary}
+        if not summary:
+            return {"status": "nothing_deletable", **base}
 
         deleted: list[dict] = []
         errors: list[dict] = []

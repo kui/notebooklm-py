@@ -1,6 +1,6 @@
 ---
 name: notebooklm-audio-overview
-description: 渡されたURL・YouTubeリンク・文章をソースにNotebookLMのノートブックを新規作成し、音声概要（ポッドキャスト風Audio Overview）の生成を開始する。容量不足なら後で再開できるようジョブとして残す。「このURLで音声概要を作って」「この記事をNotebookLMでポッドキャストにして」「この文章から音声解説を作成」「音声概要のキューを処理して」などのリクエストで使用する。
+description: 渡されたURL・YouTubeリンク・文章をソースにNotebookLMのノートブックを新規作成し、音声概要（ポッドキャスト風Audio Overview）の生成を開始する。容量不足なら後で再開できるようジョブとして残す。音声概要の再生状況（未再生・途中・再生済み）の一覧も出す。「このURLで音声概要を作って」「この記事をNotebookLMでポッドキャストにして」「この文章から音声解説を作成」「音声概要のキューを処理して」「未再生の音声概要は？」「聞いていない音声概要を一覧して」などのリクエストで使用する。
 argument-hint: <URL・YouTubeリンク・文章（複数可）> [追加の指示]
 ---
 
@@ -19,9 +19,13 @@ URLだけが渡されたら、確認せずに既定値でそのまま最後ま�
 
 - 先にジョブ台帳（`jobs/<job_id>.json`）にジョブを作り、残っている未完了ジョブを古い順に処理してから新しいジョブを処理する。
 - ノートブック作成 → ソース追加 → 処理完了待ち（最大5分）→ 音声概要の生成開始。生成の完了は待たず、ダウンロードもしない。
+- 実行のはじめに、生成を始めたジョブ（`started`）の結果を確かめる。生成に失敗していたら `waiting_quota` に戻して
+  NotebookLM の「再試行」と同じ操作でやり直す（3回失敗したら `failed`）。容量制限の応答で受け付けられた生成は後から失敗しやすく、
+  その失敗は容量が戻るまで続くので回数に数えない。
 - 各工程の前に「もう済んでいないか」を確かめるので、何度実行しても二重には作らない。複数のセッションから同時に実行してよい。
 - 容量不足ならジョブを `waiting_quota` で残し、同じ実行の残りのジョブも生成は試さない。
-- ノートブック数の上限に当たったら、古いノートブックを10件削除して作り直す（`tools/notebook_cleanup.py`）。
+- ノートブック数の上限に当たったら、音声概要を聞き終えたもの → 音声の無いものの順に古いノートブックを10件削除して
+  作り直す（`tools/notebook_cleanup.py`）。未再生・途中のものは消さない。消せるものが無ければ `waiting_notebook_slot` で保留にする。
 - 認証切れ（`AuthError`、`rpc_code=16` の `RPCError`、開くときの `CSRF token not found`）は、
   `notebooklm login` で取り直して1回だけ自動復旧を試みる。NotebookLM の操作はライブラリを直接使い、MCP は使わない。
 
@@ -67,9 +71,11 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
   `job_id` / `outcome` / `state` / `notebook_id` / `notebook_url` / `notebook_title` / `source_report` / `task_id` / `audio` / `error`、
   （`notebook_url` はノートブックが作成済みなら、生成の成否にかかわらず入る）
   あれば `possible_orphan_notebook_at` / `previous_create_unconfirmed` / `deleted_notebooks`
-- `outcome`: `started`（生成開始を確認）/ `waiting_quota`（容量不足で保留）/ `failed`（打ち切り）/
+- `outcome`: `started`（生成開始を確認）/ `waiting_quota`（容量不足で保留）/ `waiting_notebook_slot`（ノートブック上限で保留）/ `failed`（打ち切り）/
   `error`（今回は失敗。3回目で `failed` になる）/ `lease_lost`（他の実行が引き継いだ）/ `not_processed`（接続できず未着手）
 - `fatal`: 全体を止めた原因（接続失敗、認証の復旧失敗など）。無ければ `null`
+- `checked`: 生成を始めたジョブの確認結果。`result` が `completed`（完成）/ `retry`（失敗していたので再試行に回した）/
+  `failed`（失敗が3回目で打ち切り）/ `deleted`（画面で音声概要が消されていた）/ `notebook_missing`（ノートブックが無い）
 - `open_jobs`: 未完了で残っているジョブの数
 
 スクリプトが `fatal` を返したり異常終了したりしても、ジョブは台帳に残っている。原因を報告し、
@@ -84,9 +90,11 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
   本文が薄い疑いの `warning`）
 - 音声概要の形式・長さ・言語
 - 生成の状態: `started`（NotebookLM 側で待機中／作成中）／`waiting_quota`（容量不足で保留。
-  後で「キューを処理して」と頼めば再開）／`failed`・`error`（理由）
+  後で「キューを処理して」と頼めば再開）／`waiting_notebook_slot`（ノートブック数の上限で、消してよい＝聞き終えた
+  ノートブックが無いので保留。どれかを聞き終えてから「キューを処理して」と頼めば再開）／`failed`・`error`（理由）
 - `lease_lost` のジョブ、空のノートブックが残った可能性（`possible_orphan_notebook_at` / `previous_create_unconfirmed`）があれば
 - ノートブック上限で古いノートブックを削除した場合は、その一覧（`deleted_notebooks` のタイトルと id）
+- `checked` のうち `retry`・`failed`・`deleted` のもの（生成失敗を検知して再試行した／打ち切った／削除されていた）。`completed` は件数だけ
 - `open_jobs` が1以上なら、その件数
 - 完成は NotebookLM の画面で確認する旨（ノートブックの Studio パネル）
 
@@ -97,3 +105,18 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
 ノートブック: <notebook_title>
 <notebook_url>
 ```
+
+## 再生状況の一覧（「未再生の音声概要は？」など）
+
+ソースが無く、再生状況を聞かれた場合はノートブックを作らず、次を実行する（タイムアウト 600000 ミリ秒）。
+
+```
+uv run --quiet --script tools/audio_playback.py --status unplayed,in_progress
+```
+
+再生状況は NotebookLM がサーバに持つ再生位置から判定する（PC でもスマートフォンでも、再生すれば反映される。手で記録しない）。
+出力は1行の JSON: `counts`（状態ごとの件数）と `notebooks`（作成日の新しい順。`title` / `url` / `status` /
+`audios[].position_seconds` / `audios[].duration_seconds`）。全件が欲しいと言われたら `--status` を付けない。
+
+報告は日本語で、件数のあとに未再生・途中（生成失敗 `failed` を聞かれたらそれも）のノートブックを1件ずつ（途中のものは「12分/20分」のように位置も）出し、
+URL を添える。

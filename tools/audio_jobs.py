@@ -49,7 +49,10 @@ MAX_ERRORS = 3
 #   new -> creating_notebook -> notebook_created -> sources_added -> sources_ready
 #       -> generate_requested -> started
 #   どこからでも: waiting_quota（容量不足。後で再開） / failed（打ち切り）
+#   started の後: 生成の失敗を確かめたら waiting_quota に戻して再試行する（audio_overview.py の check_started）
+#   ノートブック作成時: waiting_notebook_slot（上限に達し、消せるノートブックも無い。聞き終えれば空くので後で再開）
 STATES = {
+    "waiting_notebook_slot",
     "new",
     "creating_notebook",
     "notebook_created",
@@ -258,6 +261,24 @@ def cmd_update(
         add_event(job, event, before)
         save(job)
     return {"job_id": job_id, "job": public(job)}
+
+
+def cmd_annotate(job_id: str, expect_updated_at: str, patch: dict, event: str | None) -> dict:
+    """担当者のいないジョブ（started など）を、読んだ時から変わっていなければ更新する。
+
+    生成を始めた後の結果（完成・失敗）を書き込むのに使う。state を未完了に戻せば、
+    次の claim で再び処理の対象になる。読んだ後に他の実行が更新していたら何もしない。
+    """
+    with store_lock():
+        job = load(job_id)
+        if job.get("updated_at") != expect_updated_at or lease_active(job):
+            return {"job_id": job_id, "updated": False, "job": public(job)}
+        before = job.get("state")
+        apply_patch(job, patch)
+        job.pop("lease", None)
+        add_event(job, event, before)
+        save(job)
+    return {"job_id": job_id, "updated": True, "job": public(job)}
 
 
 def cmd_list(include_all: bool) -> dict:

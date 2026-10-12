@@ -116,13 +116,26 @@ uv run --quiet --script tools/audio_overview.py   # 残っているジョブだ�
 次回スキルを使ったとき、または「音声概要のキューを処理して」と頼んだときに古い順に再開する。
 
 ノートブック数が上限に達して作成できないときは、[tools/notebook_cleanup.py](tools/notebook_cleanup.py) が
-自分の所有するノートブックを作成日の古い順に10件削除してから作り直す（確認なし・取り消し不可）。
-未完了ジョブが使っているノートブックと、共有されただけのノートブックは消さない。
+自分の所有するノートブックのうち、音声概要を聞き終えたもの → 完成した音声概要が無いものの順に、
+それぞれ作成日の古い順で10件削除してから作り直す（確認なし・取り消し不可）。
+未再生・途中まで再生・生成中のノートブック、未完了ジョブが使っているノートブック、共有されただけのノートブックは消さない。
+消せるものが無ければジョブを `waiting_notebook_slot` で保留にし、次回の実行で再開する（聞き終えれば空く）。
 複数の実行が同時に上限に当たっても、5分以内に掃除済みなら消さずにやり直すだけにする。
 何が消えるかは次で事前に確認できる。
 
 ```bash
 uv run --quiet --script tools/notebook_cleanup.py --dry-run
+```
+
+### 再生状況
+
+NotebookLM は音声概要ごとの再生位置をサーバに持っている（Web でもスマートフォンのアプリでも、再生すると更新される）。
+[tools/audio_playback.py](tools/audio_playback.py) はこれを読み、ノートブックごとに
+未再生（`unplayed`）／途中（`in_progress`）／再生済み（`played`、95% 以上か残り30秒以内）／生成中（`generating`）／
+生成失敗（`failed`）／音声なし（`no_audio`）に分ける。再生済みの記録を手で付ける必要はない。
+
+```bash
+uv run --quiet --script tools/audio_playback.py --status unplayed,in_progress
 ```
 
 ### 同時実行とやり直し
@@ -135,6 +148,9 @@ uv run --quiet --script tools/notebook_cleanup.py --dry-run
 - NotebookLM を操作する前に「もう済んでいないか」を確かめる（ソースは URL・題名で、音声概要は Studio の一覧で照合）。
   応答が失われて結果が分からないときも、確認してからやり直すので二重に作らない。
 - 容量不足以外のエラーは3回で打ち切る。
+- 生成を始めた後の失敗（NotebookLM の画面に「音声解説を生成できませんでした」と出る状態）は、次の実行のはじめに検知して
+  再試行する（3回で打ち切り。ただし容量制限の応答で受け付けられた生成の失敗は、容量切れによるものなので数えない）。
+  画面で音声概要を削除したものは作り直さない。
 
 ```bash
 uv run --quiet --script tools/audio_jobs.py list --all
