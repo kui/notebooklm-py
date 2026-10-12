@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mcp>=1.9,<2"]
+# dependencies = ["notebooklm-py"]
 # ///
 """音声概要スキルの工程（ジョブ台帳に沿ったノートブック作成〜生成開始）をまとめて実行する。
 
@@ -14,9 +14,9 @@ NotebookLM の操作・二重作成の防止・台帳の更新・エラー時の
 各ジョブは state に応じて A（ノートブック作成）→ B（ソース追加）→ C（処理待ち）→ D（生成開始）の
 途中から再開する。各手順は「もう済んでいないか」を NotebookLM で確かめてから操作する。
 
-NotebookLM には共有 MCP サーバのラッパー（tools/notebooklm_mcp_shared.py）に stdio で接続する。
-本体を別に立てると Cookie を独立にローテーションしてしまうため。ラッパーは接続中のクライアントとして
-登録されるので、Claude Code のセッションが無くても本体が起動する。
+NotebookLM の操作は notebooklm-py のライブラリ（NotebookLMClient）を直接使う。MCP は使わない。
+実行のたびにその時点の Cookie を読み込み、終われば消えるので、古い Cookie を持ち続けることがない。
+認証が切れていたら（ログインから数時間で切れる）、notebooklm login で取り直して開き直す。
 
 使い方（結果は stdout に1行の JSON、進み具合は stderr）:
   audio_overview.py --spec '<JSON>'|@path   新しいジョブを作り、残りのジョブと合わせて処理する
@@ -38,13 +38,34 @@ import os
 import re
 import subprocess
 import sys
-import time
-from datetime import UTC, datetime, timedelta
+from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+from notebooklm import NotebookLMClient
+from notebooklm.exceptions import (
+    AuthError,
+    AuthExtractionError,
+    NetworkError,
+    NotebookLimitError,
+    NotebookLMError,
+    RateLimitError,
+    RPCError,
+    ServerError,
+    SourceNotFoundError,
+    SourceProcessingError,
+    SourceTimeoutError,
+)
+from notebooklm.outcomes import CommitState
+from notebooklm.types import Artifact, ArtifactType, AudioFormat, AudioLength, Source, SourceType
+
+try:
+    # 本文が薄いソースの判定（MCP の source_wait が付ける warning と同じもの）。非公開モジュールなので無ければ省く。
+    from notebooklm._app.content_sanity import text_content_warning
+except ImportError:  # pragma: no cover
+    text_content_warning = None
 
 TOOLS = Path(__file__).resolve().parent
 ROOT = TOOLS.parent
@@ -52,11 +73,6 @@ sys.path.insert(0, str(TOOLS))
 import audio_jobs as jobs  # noqa: E402
 import notebook_cleanup  # noqa: E402
 
-SHARED = TOOLS / "notebooklm_mcp_shared.py"
-SERVER_LOG = (
-    Path(os.environ.get("NOTEBOOKLM_SHARED_MCP_STATE", Path.home() / ".notebooklm" / "shared-mcp"))
-    / "server.log"
-)
 LOGIN_CMD = [
     "uvx",
     "--from",
@@ -84,7 +100,8 @@ ACTIVE = {"pending", "in_progress", "completed"}
 # 生成が failed になったときのエラー文にだけ使うので、広めに拾う。
 QUOTA_RE = re.compile(r"quota|limit|上限|exhaust", re.I)
 YOUTUBE_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([\w-]{11})")
-ERROR_RE = re.compile(r"^(?P<code>[A-Z_]+): (?P<rest>.*)$", re.S)
+
+T = TypeVar("T")
 
 
 def progress(msg: str) -> None:
@@ -109,33 +126,7 @@ def build_options(options: dict) -> dict:
     return out
 
 
-# --- MCP 呼び出し ------------------------------------------------------------------
-
-
-class ToolErr(Exception):
-    def __init__(self, tool: str, text: str):
-        super().__init__(f"{tool}: {text}")
-        m = ERROR_RE.match(text.strip())
-        self.code = m["code"] if m else "UNKNOWN"
-        self.text = text
-        self.retriable = "retriable=true" in text
-        self.unconfirmed = "unconfirmed=true" in text
-
-    @property
-    def uncertain(self) -> bool:
-        """依頼が通ったかどうか分からない失敗。"""
-        return self.unconfirmed or self.retriable or self.code in {"TIMEOUT", "NETWORK"}
-
-    @property
-    def is_auth(self) -> bool:
-        """認証切れ。形は3通りある:
-        - コード AUTH
-        - コード RPC で本文に "(unauthenticated)"（RPC の中身が rpc_code=16。HTTP は 200 なのでライブラリの自動更新が動かない）
-        - コード UNEXPECTED で server.log に CSRF token not found（未ログイン用ページが返った）
-        """
-        if self.code == "AUTH" or "unauthenticated" in self.text.lower():
-            return True
-        return self.code == "UNEXPECTED" and csrf_failure_logged()
+# --- NotebookLM 呼び出し ------------------------------------------------------------
 
 
 class AuthFailed(Exception):
@@ -146,15 +137,27 @@ class LeaseLost(Exception):
     pass
 
 
-def csrf_failure_logged() -> bool:
-    """UNEXPECTED の原因が Cookie 切れ（未ログイン用ページで CSRF トークンが無い）か。"""
-    try:
-        with SERVER_LOG.open("rb") as f:
-            f.seek(max(0, SERVER_LOG.stat().st_size - 4000))
-            tail = f.read().decode("utf-8", "replace")
-    except OSError:
-        return False
-    return "CSRF token not found" in tail
+def is_auth_error(exc: BaseException) -> bool:
+    """認証切れか。形は3通りある:
+    - AuthError / AuthExtractionError
+    - RPCError で rpc_code=16（UNAUTHENTICATED。HTTP は 200 なのでライブラリの自動更新が動かない）
+    - クライアントを開くときの ValueError「CSRF token not found」（Cookie が切れて未ログイン用ページが返った）
+    """
+    if isinstance(exc, (AuthError, AuthExtractionError)):
+        return True
+    if isinstance(exc, RPCError) and str(exc.rpc_code) == "16":
+        return True
+    text = str(exc)
+    return isinstance(exc, ValueError) and ("CSRF token not found" in text or "Authentication expired" in text)
+
+
+def is_uncertain(exc: BaseException) -> bool:
+    """依頼が通ったかどうか分からない失敗（応答が失われた・タイムアウト・一時的なサーバエラー）。"""
+    return bool(getattr(exc, "unconfirmed", False)) or isinstance(exc, (NetworkError, ServerError))
+
+
+def error_text(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
 
 
 def run_quiet(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
@@ -164,64 +167,66 @@ def run_quiet(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, **kwargs)
 
 
-def shared_cmd(*args: str) -> list[str]:
-    return ["uv", "run", "--quiet", "--script", str(SHARED), *args]
-
-
-def recover_auth() -> str | None:
-    """ログインし直して本体を再起動する。失敗したらその理由を返す。"""
+def login() -> str | None:
+    """ブラウザプロファイルのログインから Cookie を取り直す。失敗したらその理由を返す。"""
     progress("auth error; running notebooklm login")
     try:
-        login = run_quiet(LOGIN_CMD, 200)
+        proc = run_quiet(LOGIN_CMD, 200)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"login failed: {e!r}"
-    if login.returncode != 0:
-        return "login failed: " + (login.stdout + login.stderr).decode("utf-8", "replace").strip()[-300:]
-    # 本体は起動時の Cookie を持ち続けるので、ログインだけでは直らない。
-    run_quiet(shared_cmd("--restart-server"), 60)
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        time.sleep(2)
-        status = run_quiet(shared_cmd("--status"), 30)
-        if b'"listening": true' in status.stdout:
-            return None
-    return "server did not come back after restart"
+    if proc.returncode != 0:
+        return "login failed: " + (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()[-300:]
+    return None
 
 
 class NotebookLM:
-    def __init__(self, session: ClientSession):
-        self.session = session
+    """NotebookLMClient を持ち、認証が切れたらログインして開き直し、1回だけやり直す。
+
+    開くたびにその時点の storage_state.json を読み込む。開くとき（CSRF トークンの取得）にも
+    認証切れは起きるので、開くことも do() の中で行う。
+    """
+
+    def __init__(self) -> None:
+        self.stack: AsyncExitStack | None = None
+        self.client: NotebookLMClient | None = None
         self.auth_recovered = False
 
-    async def _call_once(self, name: str, args: dict, timeout: float) -> dict:
-        result = await self.session.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout))
-        text = "".join(getattr(c, "text", "") for c in result.content)
-        if result.isError:
-            raise ToolErr(name, text)
-        if result.structuredContent is not None:
-            data = result.structuredContent
-            return data.get("result", data) if set(data) == {"result"} else data
-        return json.loads(text)
+    async def _open(self) -> NotebookLMClient:
+        if self.client is None:
+            stack = AsyncExitStack()
+            try:
+                self.client = await stack.enter_async_context(NotebookLMClient.from_storage())
+            except BaseException:
+                await stack.aclose()
+                raise
+            self.stack = stack
+        return self.client
 
-    async def call(self, name: str, args: dict, timeout: float = 120) -> dict:
+    async def close(self) -> None:
+        if self.stack is not None:
+            await self.stack.aclose()
+        self.stack = self.client = None
+
+    async def do(self, op: Callable[[NotebookLMClient], Awaitable[T]]) -> T:
         try:
-            return await self._call_once(name, args, timeout)
-        except ToolErr as e:
-            if not e.is_auth:
+            return await op(await self._open())
+        except Exception as e:
+            if not is_auth_error(e):
                 raise
             # 認証エラーはクライアントを開く前か RPC が拒否された段階で起きるので、依頼は通っていない
-            # （unconfirmed=true が付いていても、サーバが unauthenticated で拒否しているので作られていない）。
+            # （unconfirmed が付いていても、サーバが UNAUTHENTICATED で拒否しているので作られていない）。
             if self.auth_recovered:
                 raise AuthFailed(str(e)) from e
             self.auth_recovered = True
-            reason = await asyncio.to_thread(recover_auth)
+            reason = await asyncio.to_thread(login)
             if reason:
                 raise AuthFailed(reason) from e
+            await self.close()
             progress("auth recovered; retrying")
             try:
-                return await self._call_once(name, args, timeout)
-            except ToolErr as e2:
-                if e2.is_auth:
+                return await op(await self._open())
+            except Exception as e2:
+                if is_auth_error(e2):
                     raise AuthFailed(str(e2)) from e2
                 raise
 
@@ -229,10 +234,10 @@ class NotebookLM:
 # --- ジョブの処理 -------------------------------------------------------------------
 
 
-def same_source(want: dict, have: dict) -> bool:
+def same_source(want: dict, have: Source) -> bool:
     if want["type"] == "text":
-        return have.get("title") == want.get("title")
-    a, b = want.get("url") or "", have.get("url") or ""
+        return have.title == want.get("title")
+    a, b = want.get("url") or "", have.url or ""
     if a == b:
         return True
     ya, yb = YOUTUBE_ID_RE.search(a), YOUTUBE_ID_RE.search(b)
@@ -258,8 +263,8 @@ class Runner:
             self.report["error"] = f"unauthenticated: {e}"
             outcome = "error"
         except Exception as e:  # noqa: BLE001 - 想定外の失敗もジョブに記録して次へ進む
-            self._release_quietly(error=f"{type(e).__name__}: {e}")
-            self.report["error"] = f"{type(e).__name__}: {e}"
+            self._release_quietly(error=error_text(e))
+            self.report["error"] = error_text(e)
             outcome = "error"
         final = self._load()
         self.report.update(
@@ -327,36 +332,75 @@ class Runner:
             # 前回の作成が通っていた可能性がある（空タイトルなので照合できない）。
             self.report["previous_create_unconfirmed"] = True
         self._update({"state": "creating_notebook"})
+        title = self.opts["title"]
         retried_unconfirmed = cleaned = False
         while True:
             try:
-                nb = await self.nlm.call("notebook_create", {"title": self.opts["title"]})
+                nb = await self.nlm.do(lambda c: c.notebooks.create(title))
                 break
-            except ToolErr as e:
-                if e.unconfirmed and not retried_unconfirmed:
+            except NotebookLimitError as e:
+                if cleaned:
+                    return self._fail(error_text(e))
+                cleaned = True
+                progress("notebook limit; cleaning up old notebooks")
+                result = await notebook_cleanup.run_with(self.nlm.do, 10, False)
+                if result.get("status") == "deleted":
+                    self._update({"deleted_notebooks": result["deleted"]}, "notebook limit cleanup")
+                elif result.get("status") != "recently_cleaned":
+                    return self._fail(f"{error_text(e)} / cleanup: {json.dumps(result, ensure_ascii=False)}")
+            except NotebookLMError as e:
+                if is_uncertain(e) and not retried_unconfirmed:
                     retried_unconfirmed = True
-                    self._update({"possible_orphan_notebook_at": now_iso()}, "notebook_create unconfirmed")
+                    self._update({"possible_orphan_notebook_at": now_iso()}, "notebook create unconfirmed")
                     continue
-                if e.code == "NOTEBOOK_LIMIT" and not cleaned:
-                    cleaned = True
-                    progress("notebook limit; cleaning up old notebooks")
-                    result = await notebook_cleanup.run(10, False)
-                    if result.get("status") == "deleted":
-                        self._update({"deleted_notebooks": result["deleted"]}, "notebook limit cleanup")
-                    elif result.get("status") != "recently_cleaned":
-                        return self._fail(f"{e} / cleanup: {json.dumps(result, ensure_ascii=False)}")
-                    continue
-                return self._fail(str(e))
-        self._update({"state": "notebook_created", "notebook_id": nb["notebook_id"]})
+                return self._fail(error_text(e))
+        self._update({"state": "notebook_created", "notebook_id": nb.id})
         return None
 
     # B. ソース追加 ---------------------------------------------------------------
-    async def _existing_sources(self) -> list[dict]:
-        out = await self.nlm.call("source_list", {"notebook": self.job["notebook_id"], "limit": 200})
-        return out.get("sources", [])
+    async def _existing_sources(self) -> list[Source]:
+        nb = self.job["notebook_id"]
+        return await self.nlm.do(lambda c: c.sources.list(nb))
+
+    async def _add(self, targets: list[dict]) -> tuple[bool, list[dict]]:
+        """ソースを追加する。(結果不明があったか, 失敗したソース) を返す。"""
+        nb = self.job["notebook_id"]
+        uncertain = False
+        errors: list[dict] = []
+        urls = [t for t in targets if t["type"] != "text"]
+        singles = [t for t in targets if t["type"] == "text"]
+        if len(urls) > 1:
+            try:
+                outcomes = await self.nlm.do(lambda c: c.sources.add_urls_batch(nb, [t["url"] for t in urls]))
+            except NotebookLMError as e:
+                if is_uncertain(e):
+                    return True, errors
+                return False, [{"source": t["url"], "error": error_text(e)} for t in urls]
+            for o in outcomes:
+                state = o.outcome.commit_state if o.outcome else CommitState.UNKNOWN
+                if state == CommitState.CONFIRMED:
+                    continue
+                if state == CommitState.UNKNOWN:
+                    uncertain = True
+                elif o.error is not None:
+                    errors.append({"source": o.url, "error": error_text(o.error)})
+        else:
+            singles = urls + singles
+        for t in singles:
+            if t["type"] == "text":
+                op = lambda c, t=t: c.sources.add_text(nb, t["title"], t["text"])  # noqa: E731
+            else:
+                op = lambda c, t=t: c.sources.add_url(nb, t["url"])  # noqa: E731
+            try:
+                await self.nlm.do(op)
+            except NotebookLMError as e:
+                if is_uncertain(e):
+                    uncertain = True
+                else:
+                    errors.append({"source": t.get("url") or t.get("title"), "error": error_text(e)})
+        return uncertain, errors
 
     async def step_b(self) -> str | None:
-        nb = self.job["notebook_id"]
         wanted = self.job["sources"]
         errors: list[dict] = []
         for attempt in range(2):
@@ -364,33 +408,11 @@ class Runner:
             missing = [w for w in wanted if not any(same_source(w, h) for h in existing)]
             if not missing:
                 break
-            uncertain = False
-            urls = [w for w in missing if w["type"] != "text"]
-            texts = [w for w in missing if w["type"] == "text"]
-            calls: list[tuple[list[dict], dict]] = []
-            if len(urls) > 1:
-                calls.append((urls, {"notebook": nb, "urls": [w["url"] for w in urls]}))
-            elif urls:
-                calls.append((urls, {"notebook": nb, "source_type": urls[0]["type"], "url": urls[0]["url"]}))
-            for w in texts:
-                calls.append(([w], {"notebook": nb, "source_type": "text", "text": w["text"], "title": w["title"]}))
-            for targets, args in calls:
-                try:
-                    res = await self.nlm.call("source_add", args, timeout=180)
-                except ToolErr as e:
-                    if e.uncertain:
-                        uncertain = True
-                    else:
-                        errors.extend({"source": t.get("url") or t.get("title"), "error": str(e)} for t in targets)
-                    continue
-                for item in res.get("results") or []:
-                    if item.get("commit_state") not in (None, "confirmed"):
-                        uncertain = uncertain or item.get("commit_state") == "unconfirmed"
-                        if item.get("error"):
-                            errors.append({"source": item.get("url"), "error": item["error"]})
+            uncertain, errs = await self._add(missing)
+            errors.extend(errs)
             if not uncertain:
                 break
-            progress("source_add result unconfirmed; re-checking")
+            progress("source add result unconfirmed; re-checking")
         existing = await self._existing_sources()
         present = [w for w in wanted if any(same_source(w, h) for h in existing)]
         if not present:
@@ -402,47 +424,56 @@ class Runner:
         return None
 
     # C. ソース処理の完了待ち ------------------------------------------------------
-    async def _notebook_title(self, nb: str) -> str:
-        offset = 0
-        while True:
-            page = await self.nlm.call("notebook_list", {"limit": 50, "offset": offset})
-            for item in page.get("notebooks", []):
-                if item.get("id") == nb:
-                    return item.get("title", "")
-            if not page.get("has_more"):
-                return ""
-            offset += 50
+    async def _thin_warning(self, src: Source) -> str | None:
+        """本文が薄い（リンク切れ・ペイウォール・ボット対策ページ等の疑い）web ページなら警告文を返す。"""
+        if text_content_warning is None or src.kind != SourceType.WEB_PAGE:
+            return None
+        nb = self.job["notebook_id"]
+        try:
+            full = await asyncio.wait_for(self.nlm.do(lambda c: c.sources.get_fulltext(nb, src.id)), 30)
+            return text_content_warning(full.content or "", char_count=full.char_count)
+        except AuthFailed:
+            raise
+        except Exception:  # noqa: BLE001 - 判定できなくても待ちは止めない
+            return None
 
     async def step_c(self) -> str | None:
         nb = self.job["notebook_id"]
-        res = await self.nlm.call(
-            "source_wait", {"notebook": nb, "timeout": SOURCE_WAIT_SECONDS}, timeout=SOURCE_WAIT_SECONDS + 120
+        ids = [s.id for s in await self._existing_sources()]
+        results = await self.nlm.do(lambda c: c.sources.wait_all_until_ready(nb, ids, timeout=SOURCE_WAIT_SECONDS))
+        ready = [r for r in results if isinstance(r, Source)]
+        report: dict[str, Any] = {"ready": len(ready)}
+        buckets = (
+            ("failed", SourceProcessingError),
+            ("not_found", SourceNotFoundError),
+            ("timed_out", SourceTimeoutError),
         )
-        report: dict[str, Any] = {"ready": res.get("ready_count", len(res.get("ready", [])))}
-        for bucket in ("failed", "not_found", "timed_out"):
-            if res.get(bucket):
-                report[bucket] = res[bucket]
-        warnings = [{"title": s.get("title"), "warning": s["warning"]} for s in res.get("ready", []) if s.get("warning")]
+        for bucket, kind in buckets:
+            hits = [{"source_id": sid, "error": str(r)} for sid, r in zip(ids, results, strict=True) if isinstance(r, kind)]
+            if hits:
+                report[bucket] = hits
+        warnings = []
+        for src in ready:
+            if w := await self._thin_warning(src):
+                warnings.append({"title": src.title, "warning": w})
         if warnings:
             report["warning"] = warnings
         if self.job.get("source_add_errors"):
             report["add_errors"] = self.job["source_add_errors"]
-        if report["ready"] > 0:
-            title = await self._notebook_title(nb)
-            self._update({"state": "sources_ready", "notebook_title": title, "source_report": report})
+        if ready:
+            notebook = await self.nlm.do(lambda c: c.notebooks.get(nb))
+            self._update({"state": "sources_ready", "notebook_title": notebook.title, "source_report": report})
             return None
-        if res.get("timed_out"):
-            return self._fail("source_wait timeout", {"source_report": report})
+        if report.get("timed_out"):
+            return self._fail("source wait timeout", {"source_report": report})
         self._update({"state": "failed", "source_report": report}, "no ready sources", release=True)
         self.report["error"] = "no ready sources"
         return "failed"
 
     # D. 生成開始 -----------------------------------------------------------------
-    async def _audio_items(self) -> list[dict]:
-        out = await self.nlm.call(
-            "studio_list", {"notebook": self.job["notebook_id"], "kind": "audio", "detail": "compact"}
-        )
-        return out.get("items", [])
+    async def _audio_items(self) -> list[Artifact]:
+        nb = self.job["notebook_id"]
+        return await self.nlm.do(lambda c: c.artifacts.list(nb, ArtifactType.AUDIO))
 
     def _started(self, task_id: str, event: str | None = None) -> str:
         self._update({"state": "started", "task_id": task_id}, event, release=True)
@@ -458,45 +489,46 @@ class Runner:
             self._update({"state": "waiting_quota"}, "quota exhausted earlier in this run", release=True)
             return "waiting_quota"
         nb = self.job["notebook_id"]
+        o = self.opts
         for attempt in range(2):
             items = await self._audio_items()
-            active = next((i for i in items if i.get("status_label") in ACTIVE), None)
+            active = next((a for a in items if a.status_str in ACTIVE), None)
             if active:
-                return self._started(active["id"], "already exists")
-            failed = next((i for i in items if i.get("status_label") == "failed"), None)
+                return self._started(active.id, "already exists")
+            failed = next((a for a in items if a.is_failed), None)
             self._update({"state": "generate_requested"})
             try:
                 if failed:
-                    res = await self.nlm.call("studio_retry", {"notebook": nb, "artifact": failed["id"]})
+                    res = await self.nlm.do(lambda c: c.artifacts.retry_failed(nb, failed.id))
                 else:
-                    res = await self.nlm.call(
-                        "studio_generate",
-                        {
-                            "notebook": nb,
-                            "artifact_type": "audio",
-                            **{k: self.opts[k] for k in ("audio_format", "audio_length", "language", "instructions")},
-                        },
+                    res = await self.nlm.do(
+                        lambda c: c.artifacts.generate_audio(
+                            nb,
+                            language=o["language"],
+                            instructions=o["instructions"],
+                            audio_format=AudioFormat[o["audio_format"].upper().replace("-", "_")],
+                            audio_length=AudioLength[o["audio_length"].upper()],
+                        )
                     )
-            except ToolErr as e:
-                if e.code == "RATE_LIMITED":
-                    # rejected でも実際には受け付けられていることがある。
-                    items = await self._audio_items()
-                    active = next((i for i in items if i.get("status_label") in ACTIVE), None)
-                    if active:
-                        return self._started(active["id"], "accepted despite RATE_LIMITED")
-                    return self._waiting_quota(e.text[:200])
-                if e.uncertain and attempt == 0:
+            except RateLimitError as e:
+                # 拒否されたように見えても実際には受け付けられていることがある。
+                items = await self._audio_items()
+                active = next((a for a in items if a.status_str in ACTIVE), None)
+                if active:
+                    return self._started(active.id, "accepted despite RateLimitError")
+                return self._waiting_quota(error_text(e)[:200])
+            except NotebookLMError as e:
+                if is_uncertain(e) and attempt == 0:
                     progress("generate result unconfirmed; re-checking")
                     continue
-                return self._fail(str(e))
-            task_id, status = res.get("task_id"), res.get("status")
+                return self._fail(error_text(e))
+            task_id, status = res.task_id, str(res.status)
             if task_id and status in ACTIVE:
-                st = await self.nlm.call("studio_status", {"notebook": nb, "task_id": task_id})
-                status = st.get("status")
-                if status in ACTIVE:
+                st = await self.nlm.do(lambda c: c.artifacts.poll_status(nb, task_id))
+                if str(st.status) in ACTIVE:
                     return self._started(task_id)
-                res = st
-            error = str(res.get("error") or res.get("error_code") or f"status={status}")
+                res, status = st, str(st.status)
+            error = str(res.error or res.error_code or f"status={status}")
             if QUOTA_RE.search(error):
                 return self._waiting_quota(error[:200])
             return self._fail(f"generation failed: {error}")
@@ -514,25 +546,25 @@ async def run(spec: dict | None) -> dict:
         progress(f"created job {new['job_id']}")
     results: list[dict] = []
     fatal = None
-    params = StdioServerParameters(command="uv", args=["run", "--quiet", "--script", str(SHARED)], cwd=str(ROOT))
+    nlm = NotebookLM()
     try:
-        async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
-            await session.initialize()
-            runner = Runner(NotebookLM(session))
-            handled: set[str] = {new["job_id"]} if new else set()
-            while True:
-                claimed = jobs.cmd_claim(None, handled)
-                if not claimed["job_id"]:
-                    break
-                handled.add(claimed["job_id"])
-                results.append(await runner.process(claimed["job_id"], claimed["token"], claimed["job"]))
-                if results[-1].get("error", "").startswith("unauthenticated"):
-                    fatal = "unauthenticated"
-                    break
-            if new and not fatal:
-                results.append(await runner.process(new["job_id"], new["token"], new["job"]))
-    except Exception as e:  # noqa: BLE001 - 接続できなかった等。ジョブは台帳に残っている
-        fatal = f"{type(e).__name__}: {e}"
+        runner = Runner(nlm)
+        handled: set[str] = {new["job_id"]} if new else set()
+        while True:
+            claimed = jobs.cmd_claim(None, handled)
+            if not claimed["job_id"]:
+                break
+            handled.add(claimed["job_id"])
+            results.append(await runner.process(claimed["job_id"], claimed["token"], claimed["job"]))
+            if results[-1].get("error", "").startswith("unauthenticated"):
+                fatal = "unauthenticated"
+                break
+        if new and not fatal:
+            results.append(await runner.process(new["job_id"], new["token"], new["job"]))
+    except Exception as e:  # noqa: BLE001 - 想定外の失敗。ジョブは台帳に残っている
+        fatal = error_text(e)
+    finally:
+        await nlm.close()
     if new and not any(r["job_id"] == new["job_id"] for r in results):
         # 処理できなかった新しいジョブは担当だけ外し、次回の実行で拾えるようにする。
         try:
@@ -554,7 +586,7 @@ def main(argv: list[str]) -> int:
         spec = jobs.parse_json_arg(args.spec) if args.spec else None
         out = asyncio.run(run(spec))
     except Exception as e:  # noqa: BLE001
-        print(json.dumps({"fatal": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
+        print(json.dumps({"fatal": error_text(e)}, ensure_ascii=False))
         return 1
     print(json.dumps(out, ensure_ascii=False))
     return 0

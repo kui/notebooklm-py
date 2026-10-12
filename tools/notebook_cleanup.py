@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mcp>=1.9,<2"]
+# dependencies = ["notebooklm-py"]
 # ///
 """ノートブック数の上限に達したときに、古いノートブックをまとめて削除する。
 
@@ -16,8 +16,8 @@
 - 直近 COOLDOWN_SECONDS 以内に他の実行が掃除を済ませていれば、何も消さずに
   {"status": "recently_cleaned"} を返す（複数のセッションが同時に上限に当たっても、二重に消さない）。
 
-NotebookLM には共有 MCP サーバ（tools/notebooklm_mcp_shared.py が立てる HTTP サーバ）経由で接続する。
-本体を別に立てると Cookie を独立にローテーションしてしまうため。
+NotebookLM の操作は notebooklm-py のライブラリ（NotebookLMClient）を直接使う。
+audio_overview.py からは、認証切れの復旧付きでクライアントを渡す関数（NotebookLM.do）を渡して run_with() を使う。
 
 使い方（出力は stdout に1行の JSON）:
   notebook_cleanup.py [--count N] [--dry-run]
@@ -36,20 +36,23 @@ import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from notebooklm import NotebookLMClient
+from notebooklm.exceptions import NotebookLMError
+from notebooklm.types import Notebook
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# op(client) を実行する関数。audio_overview.py の NotebookLM.do（認証切れの復旧付き）など。
+Do = Callable[[Callable[[NotebookLMClient], Awaitable[Any]]], Awaitable[Any]]
 JOBS_DIR = Path(os.environ.get("AUDIO_JOBS_DIR", ROOT / "jobs"))
 LOCK_PATH = JOBS_DIR / ".cleanup.lock"
 STATE_PATH = JOBS_DIR / ".cleanup.json"
-URL = f"http://127.0.0.1:{os.environ.get('NOTEBOOKLM_SHARED_MCP_PORT', '9420')}/mcp"
 COOLDOWN_SECONDS = 5 * 60
 LOCK_TIMEOUT = 300.0
 TERMINAL = {"started", "failed"}
-PAGE = 100
 
 IS_WINDOWS = os.name == "nt"
 
@@ -127,73 +130,49 @@ def record_cleanup(deleted: list[dict]) -> None:
     os.replace(tmp, STATE_PATH)
 
 
-class ToolError(Exception):
-    pass
-
-
-async def call(session: ClientSession, name: str, args: dict[str, Any]) -> dict:
-    result = await session.call_tool(name, args)
-    text = "".join(getattr(c, "text", "") for c in result.content)
-    if result.isError:
-        raise ToolError(f"{name}: {text}")
-    if result.structuredContent is not None:
-        data = result.structuredContent
-        # FastMCP は dict 以外の戻り値を {"result": ...} で包む
-        return data.get("result", data) if set(data) == {"result"} else data
-    return json.loads(text)
-
-
-async def list_notebooks(session: ClientSession) -> list[dict]:
-    notebooks: list[dict] = []
-    offset = 0
-    while True:
-        page = await call(session, "notebook_list", {"limit": PAGE, "offset": offset})
-        notebooks.extend(page.get("notebooks", []))
-        if not page.get("has_more"):
-            return notebooks
-        offset += PAGE
-
-
-def pick(notebooks: list[dict], protected: set[str], count: int) -> list[dict]:
-    candidates = [
-        nb
-        for nb in notebooks
-        if nb.get("is_owner") is True and nb.get("id") not in protected and nb.get("created_at")
-    ]
-    candidates.sort(key=lambda nb: nb["created_at"])
+def pick(notebooks: list[Notebook], protected: set[str], count: int) -> list[Notebook]:
+    candidates = [nb for nb in notebooks if nb.is_owner and nb.id not in protected and nb.created_at]
+    candidates.sort(key=lambda nb: nb.created_at)
     return candidates[:count]
 
 
 async def run(count: int, dry_run: bool) -> dict:
-    async with streamablehttp_client(URL) as (read, write, _), ClientSession(read, write) as session:
-        await session.initialize()
-        with cleanup_lock():
-            age = last_cleanup_age()
-            if not dry_run and age is not None and age < COOLDOWN_SECONDS:
-                return {"status": "recently_cleaned", "seconds_ago": round(age)}
+    async with NotebookLMClient.from_storage() as client:
 
-            notebooks = await list_notebooks(session)
-            protected = protected_notebook_ids()
-            targets = pick(notebooks, protected, count)
-            summary = [
-                {"id": nb["id"], "title": nb.get("title", ""), "created_at": nb["created_at"]} for nb in targets
-            ]
-            base = {"total_notebooks": len(notebooks), "protected": sorted(protected)}
-            if dry_run:
-                return {"status": "dry_run", **base, "would_delete": summary}
+        async def do(op: Callable[[NotebookLMClient], Awaitable[Any]]) -> Any:
+            return await op(client)
 
-            deleted: list[dict] = []
-            errors: list[dict] = []
-            for nb in summary:
-                try:
-                    await call(session, "notebook_delete", {"notebook": nb["id"], "confirm": True})
-                    deleted.append(nb)
-                except ToolError as exc:
-                    errors.append({**nb, "error": str(exc)})
-            if deleted:
-                record_cleanup(deleted)
-            status = "deleted" if deleted else "nothing_deleted"
-            return {"status": status, **base, "deleted": deleted, "errors": errors}
+        return await run_with(do, count, dry_run)
+
+
+async def run_with(do: Do, count: int, dry_run: bool) -> dict:
+    with cleanup_lock():
+        age = last_cleanup_age()
+        if not dry_run and age is not None and age < COOLDOWN_SECONDS:
+            return {"status": "recently_cleaned", "seconds_ago": round(age)}
+
+        notebooks = await do(lambda c: c.notebooks.list())
+        protected = protected_notebook_ids()
+        targets = pick(notebooks, protected, count)
+        summary = [
+            {"id": nb.id, "title": nb.title, "created_at": nb.created_at.isoformat()} for nb in targets
+        ]
+        base = {"total_notebooks": len(notebooks), "protected": sorted(protected)}
+        if dry_run:
+            return {"status": "dry_run", **base, "would_delete": summary}
+
+        deleted: list[dict] = []
+        errors: list[dict] = []
+        for nb in summary:
+            try:
+                await do(lambda c, nb_id=nb["id"]: c.notebooks.delete(nb_id))
+                deleted.append(nb)
+            except NotebookLMError as exc:
+                errors.append({**nb, "error": f"{type(exc).__name__}: {exc}"})
+        if deleted:
+            record_cleanup(deleted)
+        status = "deleted" if deleted else "nothing_deleted"
+        return {"status": status, **base, "deleted": deleted, "errors": errors}
 
 
 def main(argv: list[str]) -> int:

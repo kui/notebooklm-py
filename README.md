@@ -40,6 +40,9 @@ uv run --quiet --script tools/notebooklm_mcp_shared.py --restart-server
   そのため `login` だけでは復旧せず、再起動が要る。
 - 本体はセッションを持たない（stateless HTTP）ので、再起動しても接続中のセッションはそのまま使える（Reconnect 不要）。
 - 本体の Cookie ローテーション（`RotateCookies`）が 200 を返していても、Google 側でセッションが無効になることがある（原因は未特定）。
+  2026-10-12 には、`login` から約2.5時間で、10分ごとのローテーションが成功し続けているのに無効になった。
+  プロセスの数や Cookie の読み直しでは防げず、数時間ごとに `login` が要るものとして扱う。
+- 音声概要のスクリプト（`tools/audio_overview.py`）は共有サーバを使わないので、この手順は要らない（自分でログインし直して続ける）。
 
 確認は `uvx --from "notebooklm-py[mcp]" notebooklm auth check --test --passive`（Cookie の更新や書き込みをしない）。
 
@@ -100,7 +103,9 @@ URL・YouTube リンク・文章を渡すと、ノートブックを作成して
 ノートブック名は付けずに作成し、NotebookLM がソースの内容から自動で命名する。
 
 工程はすべて [tools/audio_overview.py](tools/audio_overview.py) が行い、スキル（エージェント）は入力の解釈と結果の報告だけを受け持つ。
-スクリプトは共有 MCP サーバのラッパーに stdio で接続するので、Claude Code を使わずに直接実行してもよい。
+スクリプトは MCP を使わず、notebooklm-py のライブラリ（`NotebookLMClient`）を直接使う。
+実行のたびにその時点の Cookie を読み込み、認証が切れていれば `notebooklm login` で取り直して開き直す。
+Claude Code を使わずに直接実行してもよい。
 
 ```bash
 uv run --quiet --script tools/audio_overview.py --spec '{"sources": [{"type": "url", "url": "https://example.com/article"}]}'
