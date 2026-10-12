@@ -49,6 +49,7 @@ MAX_ERRORS = 3
 #   new -> creating_notebook -> notebook_created -> sources_added -> sources_ready
 #       -> generate_requested -> started
 #   どこからでも: waiting_quota（容量不足。後で再開） / failed（打ち切り）
+#   既存のノートブック（スキルの外で作ったもの）: cmd_adopt で sources_ready から始める
 #   started の後: 生成の失敗を確かめたら waiting_quota に戻して再試行する（audio_overview.py の check_started）
 #   ノートブック作成時: waiting_notebook_slot（上限に達し、消せるノートブックも無い。聞き終えれば空くので後で再開）
 STATES = {
@@ -218,6 +219,33 @@ def cmd_new(spec: dict) -> dict:
         add_event(job, "created", None)
         save(job)
     return {"job_id": job_id, "token": token, "job": public(job)}
+
+
+def cmd_adopt(notebook_id: str, notebook_title: str | None, options: dict) -> dict:
+    """スキルの外で作られた既存のノートブックに音声概要を作るジョブを登録する。
+
+    ノートブック作成とソース追加は済んでいるので sources_ready から始める（担当は付けず、次の claim で処理される）。
+    同じノートブックのジョブが既にあれば作らない（同時に実行しても二重に登録しない）。
+    """
+    with store_lock():
+        existing = next((j for j in all_jobs() if j.get("notebook_id") == notebook_id), None)
+        if existing:
+            return {"job_id": existing["id"], "created": False}
+        job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+        job = {
+            "id": job_id,
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "state": "sources_ready",
+            "adopted": True,
+            "sources": [],
+            "options": options,
+            "notebook_id": notebook_id,
+            "notebook_title": notebook_title,
+        }
+        add_event(job, "adopted existing notebook", None)
+        save(job)
+    return {"job_id": job_id, "created": True}
 
 
 def cmd_claim(job_id: str | None, exclude: set[str] | None = None) -> dict:

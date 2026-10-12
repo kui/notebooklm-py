@@ -99,6 +99,7 @@ async def report_for(do: Do, notebooks: list[Notebook]) -> list[dict]:
             "title": nb.title,
             "url": notebook_url(nb.id),
             "created_at": nb.created_at.isoformat() if nb.created_at else None,
+            "sources_count": nb.sources_count,
         }
         try:
             async with sem:

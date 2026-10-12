@@ -110,6 +110,7 @@ Claude Code を使わずに直接実行してもよい。
 ```bash
 uv run --quiet --script tools/audio_overview.py --spec '{"sources": [{"type": "url", "url": "https://example.com/article"}]}'
 uv run --quiet --script tools/audio_overview.py   # 残っているジョブだけを処理する
+uv run --quiet --script tools/audio_overview.py --adopt   # 音声の無い既存ノートブック（スキルの外で作ったものも）にも作る
 ```
 
 音声概要の生成は NotebookLM の利用枠を消費する。枠が足りないときはジョブを保留にし、

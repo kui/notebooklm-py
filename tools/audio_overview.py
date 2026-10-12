@@ -21,6 +21,8 @@ NotebookLM の操作は notebooklm-py のライブラリ（NotebookLMClient）�
 使い方（結果は stdout に1行の JSON、進み具合は stderr）:
   audio_overview.py --spec '<JSON>'|@path   新しいジョブを作り、残りのジョブと合わせて処理する
   audio_overview.py                         残っているジョブだけを処理する
+  audio_overview.py --adopt                 音声概要の無い（生成に失敗した）既存のノートブックもジョブに登録して処理する
+                                            （スキルの外で作ったものも対象。ソースが無いもの・台帳にあるものは除く）
 spec: {"sources": [{"type": "url"|"youtube", "url": ...} | {"type": "text", "text": ..., "title": ...}],
        "options": {"title", "audio_format", "audio_length", "language",
                    "instructions"（既定プロンプトを丸ごと置き換え）,
@@ -639,10 +641,38 @@ async def check_started(nlm: NotebookLM) -> list[dict]:
     return out
 
 
+# --- 既存ノートブックの取り込み ------------------------------------------------------------
+
+# 音声概要を作る対象にするノートブックの状態（audio_playback.py の判定）。
+ADOPT_STATUSES = {"no_audio", "failed"}
+
+
+async def adopt_notebooks(nlm: NotebookLM) -> list[dict]:
+    """音声概要が無い（または生成に失敗した）自分のノートブックを、既定のオプションでジョブに登録する。
+
+    台帳に既にあるノートブックは台帳側で扱う（失敗は check_started が再試行する）ので登録しない。
+    ソースが無いノートブックは生成できないので登録しない。
+    """
+    import audio_playback
+
+    entries = await audio_playback.report(nlm.do)
+    out = []
+    for e in entries:
+        if e["status"] not in ADOPT_STATUSES:
+            continue
+        base = {"notebook_title": e["title"], "notebook_url": e["url"], "playback": e["status"]}
+        if not e.get("sources_count"):
+            out.append({**base, "result": "skipped_no_sources"})
+            continue
+        res = jobs.cmd_adopt(e["notebook_id"], e["title"], build_options({}))
+        out.append({**base, "job_id": res["job_id"], "result": "adopted" if res["created"] else "already_tracked"})
+    return out
+
+
 # --- エントリポイント -----------------------------------------------------------------
 
 
-async def run(spec: dict | None) -> dict:
+async def run(spec: dict | None, adopt: bool = False) -> dict:
     new = None
     if spec is not None:
         # 実際に使う値（既定プロンプトを当てはめた後）を台帳に残す。
@@ -650,6 +680,7 @@ async def run(spec: dict | None) -> dict:
         progress(f"created job {new['job_id']}")
     results: list[dict] = []
     checked: list[dict] = []
+    adopted: list[dict] = []
     fatal = None
     nlm = NotebookLM()
     try:
@@ -659,6 +690,11 @@ async def run(spec: dict | None) -> dict:
         except NotebookLMError as e:
             # 確認できなくても、残りのジョブの処理は進める（次回また確認する）。
             checked = [{"error": error_text(e)}]
+        if adopt:
+            try:
+                adopted = await adopt_notebooks(nlm)
+            except NotebookLMError as e:
+                adopted = [{"error": error_text(e)}]
         runner = Runner(nlm)
         handled: set[str] = {new["job_id"]} if new else set()
         while True:
@@ -684,7 +720,10 @@ async def run(spec: dict | None) -> dict:
             pass
         results.append({"job_id": new["job_id"], "outcome": "not_processed", "state": "new"})
     open_jobs = jobs.cmd_list(False)["jobs"]
-    return {"checked": checked, "jobs": results, "fatal": fatal, "open_jobs": len(open_jobs)}
+    out = {"checked": checked, "jobs": results, "fatal": fatal, "open_jobs": len(open_jobs)}
+    if adopt:
+        out["adopted"] = adopted
+    return out
 
 
 def main(argv: list[str]) -> int:
@@ -692,10 +731,11 @@ def main(argv: list[str]) -> int:
     sys.stderr.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--spec")
+    ap.add_argument("--adopt", action="store_true", help="音声概要の無い既存ノートブックもジョブに登録して処理する")
     args = ap.parse_args(argv)
     try:
         spec = jobs.parse_json_arg(args.spec) if args.spec else None
-        out = asyncio.run(run(spec))
+        out = asyncio.run(run(spec, args.adopt))
     except Exception as e:  # noqa: BLE001
         print(json.dumps({"fatal": error_text(e)}, ensure_ascii=False))
         return 1
