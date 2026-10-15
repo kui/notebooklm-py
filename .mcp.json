@@ -2,8 +2,8 @@
   "mcpServers": {
     "notebooklm": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--quiet", "--script", "tools/notebooklm_mcp_shared.py"],
+      "command": "uvx",
+      "args": ["--from", "notebooklm-py[mcp]", "notebooklm-mcp"],
       "env": {}
     }
   }

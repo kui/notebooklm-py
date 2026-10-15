@@ -26,23 +26,20 @@ Chromium が未導入なら先に次を実行する。
 uvx --from "notebooklm-py[mcp,browser]" playwright install chromium
 ```
 
-共有サーバは起動のたびに認証を確かめ、切れていれば `notebooklm login` を自動で実行してから本体を起動し直す（下の「MCP サーバの共有」）。
-使っている途中で切れて、MCP のツールが `unauthenticated` を返すようになったら（`UNEXPECTED` を返し、`server.log` に
-`CSRF token not found` が出ている場合も同じ）、ログインし直してから共有サーバを再起動する。
+MCP のツールが `unauthenticated` を返すようになったら（`UNEXPECTED` を返し、ログに `CSRF token not found` が出ている場合も同じ）、
+ログインし直してから Claude Code で `notebooklm` MCP サーバを再接続する（`/mcp` から Reconnect、またはセッションを開き直す）。
 
 ```bash
 uvx --from "notebooklm-py[mcp,browser]" notebooklm login
-uv run --quiet --script tools/notebooklm_mcp_shared.py --restart-server
 ```
 
 - Chromium のプロファイルに Google のログインが残っていれば、サインインし直さずに認証情報だけ更新される。
-- 本体は起動時に読んだ Cookie をメモリに持ち続け、`login` で書き換わったファイルを読み直さない。
-  そのため `login` だけでは復旧せず、再起動が要る。
-- 本体はセッションを持たない（stateless HTTP）ので、再起動しても接続中のセッションはそのまま使える（Reconnect 不要）。
-- 本体の Cookie ローテーション（`RotateCookies`）が 200 を返していても、Google 側でセッションが無効になることがある（原因は未特定）。
+- MCP サーバは起動時に読んだ Cookie をメモリに持ち続け、`login` で書き換わったファイルを読み直さないことがある。
+  そのため `login` だけでは復旧せず、再接続が要る。
+- MCP サーバの Cookie ローテーション（`RotateCookies`）が 200 を返していても、Google 側でセッションが無効になることがある（原因は未特定）。
   2026-10-12 には、`login` から約2.5時間で、10分ごとのローテーションが成功し続けているのに無効になった。
-  プロセスの数や Cookie の読み直しでは防げず、数時間ごとに `login` が要るものとして扱う。
-- 音声概要のスクリプト（`tools/audio_overview.py`）は共有サーバを使わないので、この手順は要らない（自分でログインし直して続ける）。
+  MCP サーバを1プロセスにまとめていても起きたので、数時間ごとに `login` が要るものとして扱う。
+- 音声概要のスクリプト（`tools/audio_overview.py`）は MCP を使わないので、この手順は要らない（自分でログインし直して続ける）。
 
 確認は `uvx --from "notebooklm-py[mcp]" notebooklm auth check --test --passive`（Cookie の更新や書き込みをしない）。
 
@@ -51,29 +48,8 @@ uv run --quiet --script tools/notebooklm_mcp_shared.py --restart-server
 このディレクトリで Claude Code を開くと、[.mcp.json](.mcp.json) の `notebooklm` MCP サーバが読み込まれる。
 初回はプロジェクトの MCP サーバを有効にするか聞かれるので許可する。
 
-## MCP サーバの共有（シングルトン）
-
-Claude Code は stdio の MCP サーバをセッションごとに起動するため、notebooklm-mcp を直接起動すると
-セッションの数だけ本体が立ち上がり、それぞれが Google の Cookie を独立に更新してしまう。
-そこで [.mcp.json](.mcp.json) からは [tools/notebooklm_mcp_shared.py](tools/notebooklm_mcp_shared.py) を起動し、
-本体（`notebooklm-mcp --transport http`、`127.0.0.1:9420`）を全セッションで1つだけ動かす。
-
-- 最初のセッションが接続したときに本体を起動し、最後のセッションが終わって30秒経つと止める（常駐しない）。
-- 各セッションのラッパーは [mcp-proxy](https://pypi.org/project/mcp-proxy/) で stdio と HTTP を中継するだけで、Google とは通信しない。
-- 本体は `FASTMCP_STATELESS_HTTP=true` で起動する（MCP のセッションを持たない）。ツールはどれも呼び出しごとに完結するので失うものはなく、本体を再起動してもクライアントは切れない。
-- 本体を起動する前に `notebooklm auth check --test` で認証を確かめる。本体が止まっている間（PC の停止中など）は Cookie の更新が走らず、
-  切れていることがあるため。失敗したら本体を先に起動してから（MCP の接続を待たせないため）`notebooklm login` を実行し、成功したら本体を起動し直す。
-  Chromium のプロファイルに Google のログインが残っていれば操作なしで10秒ほどで終わる。残っていなければサインイン画面が開き、120秒待つ。
-  Cookie が切れても NotebookLM はログイン画面へリダイレクトせず未ログイン用のページを返すことがあり、ライブラリ（0.8.4）はこれを
-  認証切れと判定しないため、ライブラリ自身の自動復旧（`NOTEBOOKLM_HEADLESS_REAUTH` など）は効かない。
-- 状態とログは `~/.notebooklm/shared-mcp/`（`shim.log`、`server.log`）。
-
-```bash
-uv run --quiet --script tools/notebooklm_mcp_shared.py --status
-```
-
-注意: 本体は HTTP 経由の「リモート接続」扱いになるため、`studio_download` はファイルを保存せず署名付き URL を返し、
-ローカルファイルをソースに追加するにはアップロード手順が要る（音声概要スキルはどちらも使わない）。
+MCP サーバ（`notebooklm-mcp`、stdio）はセッションごとに1つ起動する。複数のセッションで同時に動いても、
+Cookie の更新はライブラリがプロセス間ロックと差分保存で調停する（notebooklm-py 0.8.5 で確認）。
 
 ## 音声概要スキル
 
