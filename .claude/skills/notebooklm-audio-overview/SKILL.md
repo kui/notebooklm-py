@@ -24,7 +24,9 @@ URLだけが渡されたら、確認せずに既定値でそのまま最後ま�
   自動では再試行しない。「失敗したものを再試行して」と明示的に頼まれたとき（`--retry`）だけ、NotebookLM の「再試行」と同じ操作でやり直す。
 - 各工程の前に「もう済んでいないか」を確かめるので、何度実行しても二重には作らない。複数のセッションから同時に実行してよい。
 - 生成を依頼する前に NotebookLM の使用量（5時間ごとに回復する枠と週の上限）を見て、音声概要の枠が足りなければ依頼せずに
-  `waiting_quota` で残す。
+  `waiting_quota` で残す。ただしオプション `defer` が付いていて「後で生成」の予約枠が残っていれば、
+  NotebookLM の「後で生成」で予約する（枠が回復すると NotebookLM 側で生成されるので、PC を起動していなくてよい）。
+  枠が足りているときは `defer` でもすぐに生成する。
 - 容量不足ならジョブを `waiting_quota` で残し、同じ実行の残りのジョブも生成は試さない
   （容量制限の応答なのに受け付けられた場合も、残りのジョブは試さない）。
 - ノートブック数の上限に当たったら、音声概要を聞き終えたもの → 音声の無いものの順に古いノートブックを10件削除して
@@ -51,6 +53,7 @@ URLだけが渡されたら、確認せずに既定値でそのまま最後ま�
 | `language` | `ja` | 他言語を指定された場合 |
 | `audience` | 「聞き手はITエンジニアを想定してください。」 | 聞き手を変える指定（例:「経営層向けに」）。既定プロンプトの1行目を置き換える1文を書く |
 | `extra_instructions` | なし | その他の要望（例:「セキュリティを中心に」）。既定プロンプトの末尾に追記される |
+| `defer` | `false` | 「後で生成」と指定された場合に `true`。枠が足りないとき保留にする代わりに NotebookLM の「後で生成」で予約する |
 
 既定プロンプトはITエンジニア向けに、仕組み・設計判断・トレードオフ・実務上の注意を深掘りし、
 推測は推測と分かるように話す内容（全文は `tools/audio_overview.py` の `DEFAULT_INSTRUCTIONS`）。
@@ -79,6 +82,7 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
   `job_id` / `outcome` / `state` / `notebook_id` / `notebook_url` / `notebook_title` / `source_report` / `task_id` / `audio` / `error`、
   （`notebook_url` はノートブックが作成済みなら、生成の成否にかかわらず入る）
   あれば `possible_orphan_notebook_at` / `previous_create_unconfirmed` / `deleted_notebooks`
+- `deferred`: `true` なら「後で生成」で予約した（`outcome` は `started`）
 - `outcome`: `started`（生成開始を確認）/ `waiting_quota`（容量不足で保留）/ `waiting_notebook_slot`（ノートブック上限で保留）/ `failed`（打ち切り）/
   `error`（今回は失敗。3回目で `failed` になる）/ `lease_lost`（他の実行が引き継いだ）/ `not_processed`（接続できず未着手）
 - `fatal`: 全体を止めた原因（接続失敗、認証の復旧失敗など）。無ければ `null`
@@ -89,7 +93,8 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
 - `requeued`（`--retry` のときだけ）: 再試行に回したジョブ id の一覧
 - `open_jobs`: 未完了で残っているジョブの数
 - `usage`: 実行後の使用量。`five_hour` / `weekly` に `used_percent`（使った割合）と `resets_at`（回復時刻）、
-  `audio_overview` に `has_sufficient_quota`（今すぐ作れるか）と `estimated_cost_percent`（1本の見込み消費。5時間枠に対する %）。
+  `audio_overview` に `has_sufficient_quota`（今すぐ作れるか）と `estimated_cost_percent`（1本の見込み消費。5時間枠に対する %）、
+  `deferred_slots`（「後で生成」で予約できる残りの数）。
   取れなかったときは `null`
 
 スクリプトが `fatal` を返したり異常終了したりしても、ジョブは台帳に残っている。原因を報告し、
@@ -103,7 +108,7 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
 - 追加できたソース数／失敗したソース（`source_report` の `failed` / `not_found` / `timed_out` / `add_errors`、
   本文が薄い疑いの `warning`）
 - 音声概要の形式・長さ・言語
-- 生成の状態: `started`（NotebookLM 側で待機中／作成中）／`waiting_quota`（容量不足で保留。
+- 生成の状態: `started`（NotebookLM 側で待機中／作成中。`deferred` なら「後で生成」で予約済みで、枠が回復すると NotebookLM が生成する）／`waiting_quota`（容量不足で保留。
   後で「キューを処理して」と頼めば再開。自動では再開しない）／`waiting_notebook_slot`（ノートブック数の上限で、消してよい＝聞き終えた
   ノートブックが無いので保留。どれかを聞き終えてから「キューを処理して」と頼めば再開）／`failed`・`error`（理由）
 - `lease_lost` のジョブ、空のノートブックが残った可能性（`possible_orphan_notebook_at` / `previous_create_unconfirmed`）があれば

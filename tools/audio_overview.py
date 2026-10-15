@@ -97,6 +97,7 @@ ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 import audio_jobs as jobs  # noqa: E402
 import notebook_cleanup  # noqa: E402
+from audio_playback import is_scheduled  # noqa: E402
 
 LOGIN_CMD = [
     "uvx",
@@ -113,6 +114,8 @@ DEFAULT_OPTIONS = {
     "audio_format": "deep-dive",
     "audio_length": "long",
     "language": "ja",
+    # 使用量の枠が足りないとき、保留にする代わりに「後で生成」で予約する（枠が回復すると NotebookLM が生成する）。
+    "defer": False,
 }
 DEFAULT_INSTRUCTIONS = [
     "聞き手はITエンジニアを想定してください。",
@@ -283,6 +286,14 @@ def audio_quota_short(usage: UsageSummary | None) -> bool:
     return audio is not None and not audio.has_sufficient_quota
 
 
+def deferred_slots(usage: UsageSummary | None) -> int:
+    """音声概要を「後で生成」で予約できる残りの数（分からなければ 0）。"""
+    if usage is None or usage.status != UsageSummaryStatus.READY:
+        return 0
+    audio = next((a for a in usage.actions if a.kind == UsageActionKind.AUDIO_OVERVIEW), None)
+    return (audio.remaining_deferred_artifact_generations or 0) if audio else 0
+
+
 def usage_report(usage: UsageSummary | None) -> dict | None:
     """報告用。回復時刻はこの PC の時刻帯で出す。"""
     if usage is None or usage.status != UsageSummaryStatus.READY:
@@ -300,6 +311,7 @@ def usage_report(usage: UsageSummary | None) -> dict | None:
         out["audio_overview"] = {
             "has_sufficient_quota": audio.has_sufficient_quota,
             "estimated_cost_percent": audio.estimated_cost_percent,
+            "deferred_slots": audio.remaining_deferred_artifact_generations,
         }
     return out
 
@@ -580,18 +592,24 @@ class Runner:
             return "waiting_quota"
         nb = self.job["notebook_id"]
         o = self.opts
+        defer = False
+        usage = await get_usage(self.nlm)
+        if audio_quota_short(usage):
+            if not (o.get("defer") and deferred_slots(usage) > 0):
+                # 足りないと分かっている依頼は出さない（出すと受け付けられた後で失敗する）。
+                return self._waiting_quota("insufficient quota (usage meter)")
+            defer = True
         for attempt in range(2):
             items = await self._audio_items()
-            active = next((a for a in items if a.status_str in ACTIVE), None)
+            active = next((a for a in items if a.status_str in ACTIVE or is_scheduled(a)), None)
             if active:
                 return self._started(active.id, "already exists")
             failed = next((a for a in items if a.is_failed), None)
-            if attempt == 0 and audio_quota_short(await get_usage(self.nlm)):
-                # 足りないと分かっている依頼は出さない（出すと受け付けられた後で失敗する）。
-                return self._waiting_quota("insufficient quota (usage meter)")
             self._update({"state": "generate_requested"})
             try:
-                if failed:
+                if defer:
+                    res = await self.nlm.do(lambda c: generate_audio_deferred(c, nb, o))
+                elif failed:
                     res = await self.nlm.do(lambda c: c.artifacts.retry_failed(nb, failed.id))
                 else:
                     res = await self.nlm.do(
@@ -618,6 +636,11 @@ class Runner:
                     continue
                 return self._fail(error_text(e))
             task_id, status = res.task_id, str(res.status)
+            if defer:
+                if not task_id:
+                    return self._fail("deferred generation returned no artifact")
+                self.report["deferred"] = True
+                return self._started(task_id, f"scheduled by deferred generation (status={status})")
             if task_id and status in ACTIVE:
                 st = await self.nlm.do(lambda c: c.artifacts.poll_status(nb, task_id))
                 if str(st.status) in ACTIVE:
@@ -628,6 +651,35 @@ class Runner:
                 return self._waiting_quota(error[:200])
             return self._fail(f"generation failed: {error}")
         return self._fail("generate result unconfirmed twice")
+
+
+async def generate_audio_deferred(client: NotebookLMClient, notebook_id: str, o: dict) -> Any:
+    """音声概要を「後で生成」で予約する。
+
+    Web 版の「後で生成」は、通常の生成依頼（CreateArtifact）の7番目の項目に [true] を付けて送っている
+    （Web 画面のコードで確認。ライブラリには無いので、ライブラリと同じ依頼の末尾に足して送る）。
+    受け付けられると状態 7（予約済み）の音声概要ができ、使用量の枠が回復すると NotebookLM が生成する。
+    """
+    from notebooklm._types.artifacts import _status_from_code
+    from notebooklm._web.params.artifacts import build_audio_artifact_params
+    from notebooklm.rpc import RPCMethod
+    from notebooklm.types import GenerationStatus
+
+    params = build_audio_artifact_params(
+        notebook_id,
+        await client.notebooks.get_source_ids(notebook_id),
+        language=o["language"],
+        instructions=o["instructions"],
+        audio_format=AudioFormat[o["audio_format"].upper().replace("-", "_")],
+        audio_length=AudioLength[o["audio_length"].upper()],
+    )
+    params = [*params, *([None] * (6 - len(params))), [True]]
+    result = await client.raw.call(RPCMethod.CREATE_ARTIFACT, params, allow_null=True, raise_on_null_status=True)
+    row = result[0] if isinstance(result, list) and result and isinstance(result[0], list) else []
+    task_id = row[0] if row else None
+    code = row[4] if len(row) > 4 else None
+    status = "scheduled" if code == 7 else _status_from_code(code)
+    return GenerationStatus(task_id=task_id, status=status)
 
 
 # --- 生成を始めたジョブの結果確認 ------------------------------------------------------
@@ -670,8 +722,8 @@ async def check_started(nlm: NotebookLM) -> list[dict]:
             items = await nlm.do(lambda c, nb=nb: c.artifacts.list(nb, ArtifactType.AUDIO))
             if any(a.is_completed for a in items):
                 patch, event, result = {"audio_status": "completed"}, "audio completed", "completed"
-            elif any(a.is_processing or a.is_pending for a in items):
-                continue  # 生成中。次回また見る。
+            elif any(a.is_processing or a.is_pending or is_scheduled(a) for a in items):
+                continue  # 生成中か「後で生成」で予約中。次回また見る。
             elif not items:
                 # 始めた直後は一覧への反映が遅れることがある。時間が経っても無ければ画面で削除されたので、作り直さない。
                 if datetime.now(UTC) - datetime.fromisoformat(job["updated_at"]) < timedelta(minutes=10):

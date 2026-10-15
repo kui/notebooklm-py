@@ -13,6 +13,7 @@ Web でもスマートフォンのアプリでも、再生するとこの位置�
 - in_progress  途中まで再生した音声概要がある
 - unplayed     完成しているが、再生していない音声概要がある
 - generating   音声概要を生成中（完成したものはまだ無い）
+- scheduled    「後で生成」で予約中（使用量の枠が回復すると NotebookLM が生成する）
 - failed       完成した音声概要が無く、生成に失敗したものがある（NotebookLM の画面で「再試行」が出る状態）
 - no_audio     音声概要が無い
 - unknown      一覧を取れなかった（消してよいか判断できないので、消さない側に倒す）
@@ -49,9 +50,15 @@ PLAYED_TAIL_SECONDS = 30.0
 # ノートブックごとの音声一覧を同時に取りに行く数。
 CONCURRENCY = 8
 
-STATUSES = ("unplayed", "in_progress", "generating", "unknown", "failed", "no_audio", "played")
+STATUSES = ("unplayed", "in_progress", "generating", "scheduled", "unknown", "failed", "no_audio", "played")
 # 削除してよい状態（notebook_cleanup.py が使う）。
 DELETABLE = {"played", "no_audio", "failed"}
+# 「後で生成」で予約された音声概要の状態コード。ライブラリの ArtifactStatus には無い（status_str は "unknown" になる）。
+SCHEDULED_STATUS = 7
+
+
+def is_scheduled(a: Artifact) -> bool:
+    return a.status == SCHEDULED_STATUS
 
 
 def audio_entry(a: Artifact) -> dict:
@@ -79,6 +86,8 @@ def notebook_status(audios: list[Artifact]) -> tuple[str, list[dict]]:
     if not done:
         if any(a.is_processing or a.is_pending for a in audios):
             return "generating", []
+        if any(is_scheduled(a) for a in audios):
+            return "scheduled", []
         return ("failed" if any(a.is_failed for a in audios) else "no_audio"), []
     kinds = {d["status"] for d in done}
     if kinds == {"played"}:
