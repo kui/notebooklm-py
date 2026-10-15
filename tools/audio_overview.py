@@ -8,9 +8,11 @@
 NotebookLM の操作・二重作成の防止・台帳の更新・エラー時の分岐はここで決める。
 
 流れ:
-1. --spec があれば、NotebookLM を触る前にジョブを作る（途中で落ちても台帳から再開できるように）。
-2. 残っているジョブ（未完了で、他の実行が担当していないもの）を古い順に処理する。
-3. 1. のジョブを処理する。
+1. 生成を始めたジョブ（started）の結果を確かめる。失敗していたら generation_failed にする（自動では再試行しない）。
+2. --spec があれば、NotebookLM を触る前にジョブを作り（途中で落ちても台帳から再開できるように）、そのジョブだけを処理する。
+   残っているジョブには触れない。
+3. --spec が無いとき（キューの処理を頼まれたとき）は、残っているジョブ（未完了で、他の実行が担当していないもの）を
+   古い順に処理する。--retry なら先に generation_failed のジョブを残っているジョブに戻す。
 各ジョブは state に応じて A（ノートブック作成）→ B（ソース追加）→ C（処理待ち）→ D（生成開始）の
 途中から再開する。各手順は「もう済んでいないか」を NotebookLM で確かめてから操作する。
 
@@ -19,8 +21,9 @@ NotebookLM の操作は notebooklm-py のライブラリ（NotebookLMClient）�
 認証が切れていたら（ログインから数時間で切れる）、notebooklm login で取り直して開き直す。
 
 使い方（結果は stdout に1行の JSON、進み具合は stderr）:
-  audio_overview.py --spec '<JSON>'|@path   新しいジョブを作り、残りのジョブと合わせて処理する
-  audio_overview.py                         残っているジョブだけを処理する
+  audio_overview.py --spec '<JSON>'|@path   新しいジョブを作り、そのジョブだけを処理する
+  audio_overview.py                         残っているジョブ（容量不足などで保留中のもの）を処理する
+  audio_overview.py --retry                 生成に失敗したジョブも残っているジョブに戻して処理する
   audio_overview.py --adopt                 音声概要の無い（生成に失敗した）既存のノートブックもジョブに登録して処理する
                                             （スキルの外で作ったものも対象。ソースが無いもの・台帳にあるものは除く）
 spec: {"sources": [{"type": "url"|"youtube", "url": ...} | {"type": "text", "text": ..., "title": ...}],
@@ -108,8 +111,6 @@ DEFAULT_INSTRUCTIONS = [
     "ソースに書かれていない推測や意見を述べるときは、そうと分かるように話してください。",
 ]
 ACTIVE = {"pending", "in_progress", "completed"}
-# 生成を始めた後に失敗した回数がこれに達したら、再試行をやめて failed にする。
-MAX_GENERATION_FAILURES = 3
 RATE_LIMITED_RE = re.compile(r"RATE_?LIMIT|RateLimit", re.I)
 # 生成が failed になったときのエラー文にだけ使うので、広めに拾う。
 QUOTA_RE = re.compile(r"quota|limit|上限|exhaust", re.I)
@@ -550,6 +551,8 @@ class Runner:
                 items = await self._audio_items()
                 active = next((a for a in items if a.status_str in ACTIVE), None)
                 if active:
+                    # 受け付けられても容量が戻るまで失敗するので、同じ実行の残りのジョブは依頼しない。
+                    self.quota_blocked = True
                     return self._started(active.id, "accepted despite RateLimitError")
                 return self._waiting_quota(error_text(e)[:200])
             except NotebookLMError as e:
@@ -586,9 +589,9 @@ async def check_started(nlm: NotebookLM) -> list[dict]:
     """生成を始めた（started）が完成を確かめていないジョブについて、音声概要の結果を見に行く。
 
     - 完成していれば audio_status=completed を記録し、以後は見ない。
-    - 失敗していれば waiting_quota に戻す（この後の処理で step_d が retry_failed で再試行する）。
-      容量制限の応答で受け付けられた生成が後から失敗することがあり、時間を置けば通ることが多い。
-      MAX_GENERATION_FAILURES 回失敗したら failed で打ち切る。
+    - 失敗していれば generation_failed にする。自動では再試行しない（--retry で明示的に頼まれたときだけ、
+      step_d が retry_failed で再試行する）。容量制限の応答で受け付けられた生成は後から失敗しやすいので、
+      そうだったかを記録に残す。
     - 生成中なら何もしない。音声概要が無ければ audio_status=deleted、ノートブックが消えていれば
       audio_status=notebook_missing を記録する（どちらも作り直さない）。
     """
@@ -617,19 +620,13 @@ async def check_started(nlm: NotebookLM) -> list[dict]:
                 if datetime.now(UTC) - datetime.fromisoformat(job["updated_at"]) < timedelta(minutes=10):
                     continue
                 patch, event, result = {"audio_status": "deleted"}, "audio not found", "deleted"
-            elif rate_limited_start(job):
-                # 容量制限の応答で受け付けられた生成は、容量が戻るまで失敗する。ソースの問題ではないので回数に数えない。
-                patch, result = {"state": "waiting_quota"}, "retry"
-                event = "audio generation failed after rate-limited start (not counted)"
             else:
                 failures = job.get("generation_failures", 0) + 1
-                if failures >= MAX_GENERATION_FAILURES:
-                    patch = {"state": "failed", "generation_failures": failures, "last_error": "audio generation failed"}
-                    result = "failed"
-                else:
-                    patch = {"state": "waiting_quota", "generation_failures": failures}
-                    result = "retry"
-                event = f"audio generation failed ({failures}/{MAX_GENERATION_FAILURES})"
+                patch = {"state": "generation_failed", "generation_failures": failures}
+                result = "generation_failed"
+                # 容量制限の応答で受け付けられた生成は、容量が戻るまで失敗する（ソースの問題ではない）。
+                cause = " after rate-limited start" if rate_limited_start(job) else ""
+                event = f"audio generation failed{cause} ({failures})"
         res = jobs.cmd_annotate(job["id"], job["updated_at"], patch, event)
         if res["updated"]:
             out.append({
@@ -650,7 +647,7 @@ ADOPT_STATUSES = {"no_audio", "failed"}
 async def adopt_notebooks(nlm: NotebookLM) -> list[dict]:
     """音声概要が無い（または生成に失敗した）自分のノートブックを、既定のオプションでジョブに登録する。
 
-    台帳に既にあるノートブックは台帳側で扱う（失敗は check_started が再試行する）ので登録しない。
+    台帳に既にあるノートブックは台帳側で扱う（生成の失敗は --retry で再試行する）ので登録しない。
     ソースが無いノートブックは生成できないので登録しない。
     """
     import audio_playback
@@ -672,32 +669,37 @@ async def adopt_notebooks(nlm: NotebookLM) -> list[dict]:
 # --- エントリポイント -----------------------------------------------------------------
 
 
-async def run(spec: dict | None, adopt: bool = False) -> dict:
+async def run(spec: dict | None, adopt: bool = False, retry: bool = False) -> dict:
     new = None
     if spec is not None:
         # 実際に使う値（既定プロンプトを当てはめた後）を台帳に残す。
         new = jobs.cmd_new({**spec, "options": build_options(spec.get("options", {}))})
         progress(f"created job {new['job_id']}")
+    # 新しいジョブを頼まれただけなら、残っているジョブには触れない（キューの処理は明示的に頼まれたときだけ）。
+    process_queue = new is None or adopt or retry
     results: list[dict] = []
     checked: list[dict] = []
     adopted: list[dict] = []
+    requeued: list[str] = []
     fatal = None
     nlm = NotebookLM()
     try:
-        # 失敗していた生成は waiting_quota に戻るので、この後の claim で再試行される。
+        # 失敗していた生成は generation_failed になる。再試行は --retry のときだけ。
         try:
             checked = await check_started(nlm)
         except NotebookLMError as e:
-            # 確認できなくても、残りのジョブの処理は進める（次回また確認する）。
+            # 確認できなくても、ジョブの処理は進める（次回また確認する）。
             checked = [{"error": error_text(e)}]
         if adopt:
             try:
                 adopted = await adopt_notebooks(nlm)
             except NotebookLMError as e:
                 adopted = [{"error": error_text(e)}]
+        if retry:
+            requeued = jobs.cmd_requeue()["requeued"]
         runner = Runner(nlm)
         handled: set[str] = {new["job_id"]} if new else set()
-        while True:
+        while process_queue:
             claimed = jobs.cmd_claim(None, handled)
             if not claimed["job_id"]:
                 break
@@ -723,6 +725,8 @@ async def run(spec: dict | None, adopt: bool = False) -> dict:
     out = {"checked": checked, "jobs": results, "fatal": fatal, "open_jobs": len(open_jobs)}
     if adopt:
         out["adopted"] = adopted
+    if retry:
+        out["requeued"] = requeued
     return out
 
 
@@ -732,10 +736,11 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--spec")
     ap.add_argument("--adopt", action="store_true", help="音声概要の無い既存ノートブックもジョブに登録して処理する")
+    ap.add_argument("--retry", action="store_true", help="生成に失敗したジョブも残っているジョブに戻して処理する")
     args = ap.parse_args(argv)
     try:
         spec = jobs.parse_json_arg(args.spec) if args.spec else None
-        out = asyncio.run(run(spec, args.adopt))
+        out = asyncio.run(run(spec, args.adopt, args.retry))
     except Exception as e:  # noqa: BLE001
         print(json.dumps({"fatal": error_text(e)}, ensure_ascii=False))
         return 1

@@ -56,7 +56,7 @@ LOCK_PATH = JOBS_DIR / ".cleanup.lock"
 STATE_PATH = JOBS_DIR / ".cleanup.json"
 COOLDOWN_SECONDS = 5 * 60
 LOCK_TIMEOUT = 300.0
-TERMINAL = {"started", "failed"}
+TERMINAL = {"started", "generation_failed", "failed"}
 
 IS_WINDOWS = os.name == "nt"
 
@@ -100,7 +100,7 @@ def cleanup_lock() -> Iterator[None]:
 
 
 def protected_notebook_ids() -> set[str]:
-    """未完了ジョブと、生成の結果をまだ確かめていない started のジョブ（失敗なら再試行する）が使っている notebook_id。"""
+    """未完了ジョブと、生成の結果をまだ確かめていない started のジョブが使っている notebook_id。"""
     ids = set()
     for path in JOBS_DIR.glob("*.json"):
         if path.name.startswith("."):

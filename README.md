@@ -109,12 +109,14 @@ Claude Code を使わずに直接実行してもよい。
 
 ```bash
 uv run --quiet --script tools/audio_overview.py --spec '{"sources": [{"type": "url", "url": "https://example.com/article"}]}'
-uv run --quiet --script tools/audio_overview.py   # 残っているジョブだけを処理する
+uv run --quiet --script tools/audio_overview.py   # 残っているジョブ（保留中のもの）を処理する
+uv run --quiet --script tools/audio_overview.py --retry   # 生成に失敗したジョブも再試行する
 uv run --quiet --script tools/audio_overview.py --adopt   # 音声の無い既存ノートブック（スキルの外で作ったものも）にも作る
 ```
 
 音声概要の生成は NotebookLM の利用枠を消費する。枠が足りないときはジョブを保留にし、
-次回スキルを使ったとき、または「音声概要のキューを処理して」と頼んだときに古い順に再開する。
+「音声概要のキューを処理して」と頼んだときに古い順に再開する。新しいソースで音声概要を頼んだときは
+そのジョブだけを処理し、保留中のジョブには触れない。
 
 ノートブック数が上限に達して作成できないときは、[tools/notebook_cleanup.py](tools/notebook_cleanup.py) が
 自分の所有するノートブックのうち、音声概要を聞き終えたもの → 完成した音声概要が無いものの順に、
@@ -150,7 +152,7 @@ uv run --quiet --script tools/audio_playback.py --status unplayed,in_progress
   応答が失われて結果が分からないときも、確認してからやり直すので二重に作らない。
 - 容量不足以外のエラーは3回で打ち切る。
 - 生成を始めた後の失敗（NotebookLM の画面に「音声解説を生成できませんでした」と出る状態）は、次の実行のはじめに検知して
-  再試行する（3回で打ち切り。ただし容量制限の応答で受け付けられた生成の失敗は、容量切れによるものなので数えない）。
+  `generation_failed` にする。自動では再試行せず、「失敗したものを再試行して」と頼んだとき（`--retry`）だけやり直す。
   画面で音声概要を削除したものは作り直さない。
 
 ```bash

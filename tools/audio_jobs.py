@@ -50,7 +50,8 @@ MAX_ERRORS = 3
 #       -> generate_requested -> started
 #   どこからでも: waiting_quota（容量不足。後で再開） / failed（打ち切り）
 #   既存のノートブック（スキルの外で作ったもの）: cmd_adopt で sources_ready から始める
-#   started の後: 生成の失敗を確かめたら waiting_quota に戻して再試行する（audio_overview.py の check_started）
+#   started の後: 生成の失敗を確かめたら generation_failed にする（audio_overview.py の check_started）。
+#     自動では再試行しない。明示的に頼まれたとき（cmd_requeue）だけ waiting_quota に戻す
 #   ノートブック作成時: waiting_notebook_slot（上限に達し、消せるノートブックも無い。聞き終えれば空くので後で再開）
 STATES = {
     "waiting_notebook_slot",
@@ -62,9 +63,10 @@ STATES = {
     "generate_requested",
     "waiting_quota",
     "started",
+    "generation_failed",
     "failed",
 }
-TERMINAL = {"started", "failed"}
+TERMINAL = {"started", "generation_failed", "failed"}
 
 IS_WINDOWS = os.name == "nt"
 
@@ -246,6 +248,20 @@ def cmd_adopt(notebook_id: str, notebook_title: str | None, options: dict) -> di
         add_event(job, "adopted existing notebook", None)
         save(job)
     return {"job_id": job_id, "created": True}
+
+
+def cmd_requeue() -> dict:
+    """生成に失敗したジョブ（generation_failed）を waiting_quota に戻し、次の claim で再試行されるようにする。"""
+    out = []
+    with store_lock():
+        for job in all_jobs():
+            if job.get("state") != "generation_failed" or lease_active(job):
+                continue
+            apply_patch(job, {"state": "waiting_quota"})
+            add_event(job, "requeued by request", "generation_failed")
+            save(job)
+            out.append(job["id"])
+    return {"requeued": out}
 
 
 def cmd_claim(job_id: str | None, exclude: set[str] | None = None) -> dict:
