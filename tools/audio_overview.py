@@ -64,7 +64,18 @@ from notebooklm.exceptions import (
     SourceTimeoutError,
 )
 from notebooklm.outcomes import CommitState
-from notebooklm.types import Artifact, ArtifactType, AudioFormat, AudioLength, Source, SourceType
+from notebooklm.types import (
+    Artifact,
+    ArtifactType,
+    AudioFormat,
+    AudioLength,
+    Source,
+    SourceType,
+    UsageActionKind,
+    UsageSummary,
+    UsageSummaryStatus,
+    UsageWindowKind,
+)
 
 try:
     # NOTEBOOKLM_BASE_URL を反映した NotebookLM の URL。非公開モジュールなので無ければ既定のホストを使う。
@@ -248,6 +259,49 @@ class NotebookLM:
                 if is_auth_error(e2):
                     raise AuthFailed(str(e2)) from e2
                 raise
+
+
+# --- 使用量 -----------------------------------------------------------------------
+# NotebookLM（Gemini Notebook）は、音声概要・チャット・レポートなどで1つの使用量枠を共有する。
+# 枠は5時間ごとに回復し、別に週の上限がある。音声概要1本の見込み消費や、今の枠で足りるかもここから分かる。
+
+
+async def get_usage(nlm: NotebookLM) -> UsageSummary | None:
+    """使用量を取る。取れなければ None（使用量で判断せず、これまでどおり依頼の応答で判断する）。"""
+    try:
+        return await nlm.do(lambda c: c.settings.get_usage())
+    except Exception as e:  # noqa: BLE001 - 使用量は判断の補助なので、取れなくても処理は止めない
+        progress(f"usage unavailable: {error_text(e)}")
+        return None
+
+
+def audio_quota_short(usage: UsageSummary | None) -> bool:
+    """使用量の上で、音声概要を作る枠が足りないと分かっているか。"""
+    if usage is None or usage.status != UsageSummaryStatus.READY:
+        return False
+    audio = next((a for a in usage.actions if a.kind == UsageActionKind.AUDIO_OVERVIEW), None)
+    return audio is not None and not audio.has_sufficient_quota
+
+
+def usage_report(usage: UsageSummary | None) -> dict | None:
+    """報告用。回復時刻はこの PC の時刻帯で出す。"""
+    if usage is None or usage.status != UsageSummaryStatus.READY:
+        return None if usage is None else {"status": usage.status.value}
+    names = {UsageWindowKind.FIVE_HOUR: "five_hour", UsageWindowKind.WEEKLY: "weekly"}
+    out: dict[str, Any] = {
+        names[w.kind]: {
+            "used_percent": round(w.used_percent, 1),
+            "resets_at": w.resets_at.astimezone().isoformat(timespec="minutes"),
+        }
+        for w in usage.windows
+    }
+    audio = next((a for a in usage.actions if a.kind == UsageActionKind.AUDIO_OVERVIEW), None)
+    if audio is not None:
+        out["audio_overview"] = {
+            "has_sufficient_quota": audio.has_sufficient_quota,
+            "estimated_cost_percent": audio.estimated_cost_percent,
+        }
+    return out
 
 
 # --- ジョブの処理 -------------------------------------------------------------------
@@ -532,6 +586,9 @@ class Runner:
             if active:
                 return self._started(active.id, "already exists")
             failed = next((a for a in items if a.is_failed), None)
+            if attempt == 0 and audio_quota_short(await get_usage(self.nlm)):
+                # 足りないと分かっている依頼は出さない（出すと受け付けられた後で失敗する）。
+                return self._waiting_quota("insufficient quota (usage meter)")
             self._update({"state": "generate_requested"})
             try:
                 if failed:
@@ -710,8 +767,10 @@ async def run(spec: dict | None, adopt: bool = False, retry: bool = False) -> di
                 break
         if new and not fatal:
             results.append(await runner.process(new["job_id"], new["token"], new["job"]))
+        usage = await get_usage(nlm) if fatal is None else None
     except Exception as e:  # noqa: BLE001 - 想定外の失敗。ジョブは台帳に残っている
         fatal = error_text(e)
+        usage = None
     finally:
         await nlm.close()
     if new and not any(r["job_id"] == new["job_id"] for r in results):
@@ -722,7 +781,13 @@ async def run(spec: dict | None, adopt: bool = False, retry: bool = False) -> di
             pass
         results.append({"job_id": new["job_id"], "outcome": "not_processed", "state": "new"})
     open_jobs = jobs.cmd_list(False)["jobs"]
-    out = {"checked": checked, "jobs": results, "fatal": fatal, "open_jobs": len(open_jobs)}
+    out = {
+        "checked": checked,
+        "jobs": results,
+        "fatal": fatal,
+        "open_jobs": len(open_jobs),
+        "usage": usage_report(usage),
+    }
     if adopt:
         out["adopted"] = adopted
     if retry:
