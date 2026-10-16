@@ -115,7 +115,8 @@ DEFAULT_OPTIONS = {
     "audio_length": "long",
     "language": "ja",
     # 使用量の枠が足りないとき、保留にする代わりに「後で生成」で予約する（枠が回復すると NotebookLM が生成する）。
-    "defer": False,
+    # 予約枠も埋まっていればローカルのキューに保留する。
+    "defer": True,
 }
 DEFAULT_INSTRUCTIONS = [
     "聞き手はITエンジニアを想定してください。",
