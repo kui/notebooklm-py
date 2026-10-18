@@ -146,6 +146,8 @@ def save(job: dict) -> None:
 def all_jobs() -> list[dict]:
     jobs = []
     for p in JOBS_DIR.glob("*.json"):
+        if p.name.startswith("."):  # .cleanup.json など、ジョブ以外の記録
+            continue
         with contextlib.suppress(OSError, ValueError):
             jobs.append(json.loads(p.read_text(encoding="utf-8")))
     return sorted(jobs, key=lambda j: (j.get("created_at", ""), j.get("id", "")))

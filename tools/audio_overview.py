@@ -185,6 +185,26 @@ def is_auth_error(exc: BaseException) -> bool:
     return isinstance(exc, ValueError) and ("CSRF token not found" in text or "Authentication expired" in text)
 
 
+async def create_notebook(client: NotebookLMClient, title: str):
+    """ノートブックを作る。上限に当たったときは NotebookLimitError にそろえる。
+
+    ライブラリは rpc_code=3 しか上限と見なさないが、rpc_code=8（RESOURCE_EXHAUSTED）で返ることもある。
+    そのときは所有数が上限に達しているかを確かめてから NotebookLimitError にする。
+    """
+    try:
+        return await client.notebooks.create(title)
+    except RPCError as e:
+        if str(e.rpc_code) != "8":
+            raise
+        limit = (await client.settings.get_account_limits()).notebook_limit
+        if limit is None:
+            raise
+        owned = sum(1 for nb in await client.notebooks.list() if nb.is_owner)
+        if owned < max(limit - 1, 0):
+            raise
+        raise NotebookLimitError(owned, limit=limit, original_error=e) from e
+
+
 def is_uncertain(exc: BaseException) -> bool:
     """依頼が通ったかどうか分からない失敗（応答が失われた・タイムアウト・一時的なサーバエラー）。"""
     return bool(getattr(exc, "unconfirmed", False)) or isinstance(exc, (NetworkError, ServerError))
@@ -428,7 +448,7 @@ class Runner:
         retried_unconfirmed = cleaned = False
         while True:
             try:
-                nb = await self.nlm.do(lambda c: c.notebooks.create(title))
+                nb = await self.nlm.do(lambda c: create_notebook(c, title))
                 break
             except NotebookLimitError as e:
                 if cleaned:
