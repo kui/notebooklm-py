@@ -3,7 +3,8 @@
 # ///
 """音声概要スキルのジョブ記録（同時実行しても壊れない作業台帳）。
 
-1ジョブ = jobs/<job_id>.json。スキルは NotebookLM を操作する前後でここに
+1ジョブ = jobs/<job_id>.json（jobs/ は本体のチェックアウト直下。git worktree から実行しても同じ台帳を使う。
+AUDIO_JOBS_DIR で変えられる）。スキルは NotebookLM を操作する前後でここに
 「どこまで進んだか」を書き、中断・失敗・容量不足から安全に再開できるようにする。
 
 同時実行への備え:
@@ -33,13 +34,36 @@ import contextlib
 import json
 import os
 import secrets
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
-JOBS_DIR = Path(os.environ.get("AUDIO_JOBS_DIR", Path(__file__).resolve().parent.parent / "jobs"))
+
+
+def default_jobs_dir() -> Path:
+    """本体のチェックアウトの jobs/。
+
+    git worktree（Claude Code は .claude/worktrees/<name>/ に作る）から実行しても台帳が分かれないよう、
+    共通の .git の親（本体のチェックアウト）を使う。git が使えなければこのリポジトリの jobs/。
+    """
+    repo = Path(__file__).resolve().parent.parent
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=repo, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return repo / "jobs"
+    common = Path(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
+    if common is None or common.name != ".git":
+        return repo / "jobs"
+    return common.parent / "jobs"
+
+
+JOBS_DIR = Path(os.environ.get("AUDIO_JOBS_DIR") or default_jobs_dir())
 LOCK_PATH = JOBS_DIR / ".lock"
 LEASE_SECONDS = float(os.environ.get("AUDIO_JOBS_LEASE_SECONDS", str(30 * 60)))
 LOCK_TIMEOUT = 30.0
