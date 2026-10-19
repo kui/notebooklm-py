@@ -45,13 +45,13 @@ from typing import Any
 from notebooklm import NotebookLMClient
 from notebooklm.exceptions import NotebookLMError
 
+import audio_jobs
 import audio_playback
-
-ROOT = Path(__file__).resolve().parent.parent
 
 # op(client) を実行する関数。audio_overview.py の NotebookLM.do（認証切れの復旧付き）など。
 Do = Callable[[Callable[[NotebookLMClient], Awaitable[Any]]], Awaitable[Any]]
-JOBS_DIR = Path(os.environ.get("AUDIO_JOBS_DIR", ROOT / "jobs"))
+# 記録ファイルもジョブ台帳と同じ置き場所（git worktree から実行しても本体の jobs/）。
+JOBS_DIR = audio_jobs.JOBS_DIR
 LOCK_PATH = JOBS_DIR / ".cleanup.lock"
 STATE_PATH = JOBS_DIR / ".cleanup.json"
 COOLDOWN_SECONDS = 5 * 60

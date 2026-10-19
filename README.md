@@ -124,6 +124,11 @@ uv run --quiet --script tools/audio_playback.py --status unplayed,in_progress
 スキルは複数のセッションで同時に実行してもよい。進み具合は [tools/audio_jobs.py](tools/audio_jobs.py) が
 `jobs/<job_id>.json` に1ジョブ1ファイルで記録する（プロセス間ロックの中で読み書きし、ファイルは丸ごと置き換える）。
 
+- `jobs/` は本体のチェックアウト直下に置く。git worktree（Claude Code のデスクトップアプリが `.claude/worktrees/<name>/` に作るもの）
+  から実行しても、`git rev-parse --git-common-dir` の親にある本体の `jobs/` を使うので、台帳は分かれない。
+  [tools/notebook_cleanup.py](tools/notebook_cleanup.py) の記録（`.cleanup.json`・`.cleanup.lock`）も同じ場所に置く。
+  環境変数 `AUDIO_JOBS_DIR` を設定すれば、その場所を使う。
+
 - 各ジョブには担当中の実行を示す期限付きの担当権（30分）があり、担当中のジョブを他の実行が処理することはない。
   担当していた実行が落ちても、期限が切れれば次の実行が引き継ぐ。
 - NotebookLM を操作する前に「もう済んでいないか」を確かめる（ソースは URL・題名で、音声概要は Studio の一覧で照合）。
