@@ -22,6 +22,7 @@ notebook_cleanup.py はこの判定を使い、played・no_audio・failed のノ
 
 使い方（結果は stdout に1行の JSON）:
   audio_playback.py [--status unplayed,in_progress,...]   指定した状態のノートブックだけを出す（既定はすべて）
+  audio_playback.py --mark-played                         played のノートブックの絵文字を PLAYED_EMOJI にする
 終了コード: 0 成功 / 1 失敗
 """
 
@@ -55,6 +56,8 @@ STATUSES = ("unplayed", "in_progress", "generating", "scheduled", "unknown", "fa
 DELETABLE = {"played", "no_audio", "failed"}
 # 「後で生成」で予約された音声概要の状態コード。ライブラリの ArtifactStatus には無い（status_str は "unknown" になる）。
 SCHEDULED_STATUS = 7
+# 聞き終えたノートブックに付ける絵文字（--mark-played）。
+PLAYED_EMOJI = "✅"
 
 
 def is_scheduled(a: Artifact) -> bool:
@@ -132,23 +135,44 @@ def summarize(entries: list[dict]) -> dict:
     return {s: sum(1 for e in entries if e["status"] == s) for s in STATUSES}
 
 
-async def run(statuses: set[str] | None) -> dict:
+async def mark_played(do: Do, entries: list[dict]) -> list[dict]:
+    """played のノートブックの絵文字を PLAYED_EMOJI にする。一覧では今の絵文字が分からないので、毎回付け直す。"""
+    sem = asyncio.Semaphore(CONCURRENCY)
+
+    async def one(client: NotebookLMClient, e: dict) -> dict:
+        try:
+            async with sem:
+                await client.notebooks.set_emoji(e["notebook_id"], PLAYED_EMOJI)
+        except NotebookLMError as exc:
+            return {"notebook_id": e["notebook_id"], "title": e["title"], "error": f"{type(exc).__name__}: {exc}"}
+        return {"notebook_id": e["notebook_id"], "title": e["title"]}
+
+    played = [e for e in entries if e["status"] == "played"]
+    return await do(lambda c: asyncio.gather(*(one(c, e) for e in played)))
+
+
+async def run(statuses: set[str] | None, mark: bool = False) -> dict:
     # 認証切れの復旧（notebooklm login）は audio_overview.py のものを使う。
     from audio_overview import NotebookLM
 
     nlm = NotebookLM()
     try:
         entries = await report(nlm.do)
+        marked = await mark_played(nlm.do, entries) if mark else None
     finally:
         await nlm.close()
     shown = [e for e in entries if statuses is None or e["status"] in statuses]
-    return {"counts": summarize(entries), "notebooks": shown}
+    out: dict[str, Any] = {"counts": summarize(entries), "notebooks": shown}
+    if marked is not None:
+        out["marked"] = marked
+    return out
 
 
 def main(argv: list[str]) -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--status", help="カンマ区切り: " + ",".join(STATUSES))
+    parser.add_argument("--mark-played", action="store_true", help=f"played のノートブックの絵文字を {PLAYED_EMOJI} にする")
     args = parser.parse_args(argv)
     statuses = None
     if args.status:
@@ -156,7 +180,7 @@ def main(argv: list[str]) -> int:
         if unknown := statuses - set(STATUSES):
             parser.error(f"unknown status: {sorted(unknown)}")
     try:
-        out = asyncio.run(run(statuses))
+        out = asyncio.run(run(statuses, args.mark_played))
     except Exception as exc:  # noqa: BLE001 - 呼び出し側には JSON で返す
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
         return 1

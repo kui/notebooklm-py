@@ -119,6 +119,12 @@ NotebookLM は音声概要ごとの再生位置をサーバに持っている（
 uv run --quiet --script tools/audio_playback.py --status unplayed,in_progress
 ```
 
+`--mark-played` を付けると、再生済み（`played`）のノートブックの絵文字を ✅ にする（一覧では今の絵文字が分からないので、毎回付け直す）。
+
+```bash
+uv run --quiet --script tools/audio_playback.py --status played --mark-played
+```
+
 ### 同時実行とやり直し
 
 スキルは複数のセッションで同時に実行してもよい。進み具合は [tools/audio_jobs.py](tools/audio_jobs.py) が
