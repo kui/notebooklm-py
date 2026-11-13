@@ -36,14 +36,14 @@ URLだけが渡されたら、確認せずに既定値でそのまま最後ま�
 
 ## 1. 入力の解釈
 
-入力からソースを分類する。
+1回の実行で作るノートブックは1つ。入力に URL がいくつあっても（hn-summary のページが複数でも）1回だけ実行する。
 
-- `https://hn-summary.k-ui.jp/items/<id>` → そのページ自身はソースにしない。エージェントがページを取得して読み、
-  ソースとなる URL を抜き出す（スクリプトには抜き出した URL を `url` として渡す）:
-  - 元記事の URL（「元記事」のリンク）と HN の URL（「HNディスカッション」のリンク、`https://news.ycombinator.com/item?id=<id>`）の2つ。
-  - ただし元記事の本文を取得できなかった旨がページに書かれていれば（例:「元記事の本文を取得できなかったため…」）、HN の URL だけ。
-    元記事が HN 自身（Ask HN など）のときも HN の URL だけ。
-  - ページを取得できなければ、HN の URL だけで進め、報告でその旨を伝える。
+**入力が URL だけ**（空白・改行区切りで並んでいるだけ）なら、ここでは何も解釈しない。spec も作らず、
+2. の `--input` に入力をそのまま渡す。hn-summary のページの展開もスクリプトが行う。
+
+URL 以外（地の文のソースや生成への要望）が含まれるときだけ、spec を書く。ソースの分類:
+
+- `https://hn-summary.k-ui.jp/items/<id>` → `{"type": "url", "url": ...}` のまま渡す（スクリプトがページを読み、元記事と HN の URL に置き換える）
 - `https://www.youtube.com/...` / `https://youtu.be/...` → `{"type": "youtube", "url": ...}`
 - その他の `http(s)://` → `{"type": "url", "url": ...}`
 - それ以外の地の文 → `{"type": "text", "text": ..., "title": <内容に合う短い題>}`（まとまり単位で1ソース）
@@ -73,14 +73,19 @@ URLだけが渡されたら、確認せずに既定値でそのまま最後ま�
 
 ## 2. 実行
 
-spec をスクラッチパッドに JSON で書き、Bash で実行する（タイムアウトは 600000 ミリ秒にする。
-ソースの処理待ちとログインで数分かかることがある）。
+Bash で1回だけ実行する（タイムアウトは 600000 ミリ秒にする。ソースの処理待ちとログインで数分かかることがある）。
+
+入力が URL だけなら、入力をそのまま渡す:
+
+```
+uv run --quiet --script tools/audio_overview.py --input '<入力>'
+```
+
+それ以外は spec をスクラッチパッドに JSON で書いて渡す（`{"sources": [...], "options": {...}}`。options は指定したキーだけ）:
 
 ```
 uv run --quiet --script tools/audio_overview.py --spec @<spec.json のパス>
 ```
-
-spec の形: `{"sources": [...], "options": {...}}`（options は指定したキーだけ）。
 
 出力は stdout に1行の JSON（stderr は進み具合）:
 
@@ -92,6 +97,8 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
 - `outcome`: `started`（生成開始を確認）/ `waiting_quota`（容量不足で保留）/ `waiting_notebook_slot`（ノートブック上限で保留）/ `failed`（打ち切り）/
   `error`（今回は失敗。3回目で `failed` になる）/ `lease_lost`（他の実行が引き継いだ）/ `not_processed`（接続できず未着手）
 - `fatal`: 全体を止めた原因（接続失敗、認証の復旧失敗など）。無ければ `null`
+- `expanded`（hn-summary のページを渡したときだけ）: ページごとに `page` / `urls`（ソースにした URL）/
+  `note`（元記事を外した理由。本文を取得できていない・ページを取得できないなど）
 - `adopted`（`--adopt` のときだけ）: 既存ノートブックごとに `result` が `adopted`（登録した）/ `already_tracked`（台帳に既にある）/
   `skipped_no_sources`（ソースが無い）。登録したジョブの結果は `jobs` に入る
 - `checked`: 生成を始めたジョブの確認結果。`result` が `completed`（完成）/ `generation_failed`（生成に失敗していた。再試行は頼まれたときだけ）/
@@ -113,6 +120,7 @@ spec の形: `{"sources": [...], "options": {...}}`（options は指定したキ
 - ノートブック名と id、ジョブ id
 - 追加できたソース数／失敗したソース（`source_report` の `failed` / `not_found` / `timed_out` / `add_errors`、
   本文が薄い疑いの `warning`）
+- `expanded` に `note` があれば、そのページと理由（元記事をソースにしなかった）
 - 音声概要の形式・長さ・言語
 - 生成の状態: `started`（NotebookLM 側で待機中／作成中。`deferred` なら「後で生成」で予約済みで、枠が回復すると NotebookLM が生成する）／`waiting_quota`（容量不足で保留。
   後で「キューを処理して」と頼めば再開。自動では再開しない）／`waiting_notebook_slot`（ノートブック数の上限で、消してよい＝聞き終えた
