@@ -21,6 +21,7 @@ NotebookLM の操作は notebooklm-py のライブラリ（NotebookLMClient）�
 認証が切れていたら（ログインから数時間で切れる）、notebooklm login で取り直して開き直す。
 
 使い方（結果は stdout に1行の JSON、進み具合は stderr）:
+  audio_overview.py --input '<URL ...>'     URL をすべてソースにした1つのジョブを作り、そのジョブだけを処理する
   audio_overview.py --spec '<JSON>'|@path   新しいジョブを作り、そのジョブだけを処理する
   audio_overview.py                         残っているジョブ（容量不足などで保留中のもの）を処理する
   audio_overview.py --retry                 生成に失敗したジョブも残っているジョブに戻して処理する
@@ -31,6 +32,8 @@ spec: {"sources": [{"type": "url"|"youtube", "url": ...} | {"type": "text", "tex
                    "instructions"（既定プロンプトを丸ごと置き換え）,
                    "audience"（既定プロンプトの1行目＝聞き手を置き換え）,
                    "extra_instructions"（既定プロンプトの末尾に追記）}}
+hn-summary のページ（https://hn-summary.k-ui.jp/items/<id>）は、--input でも --spec でも、ページに載っている
+元記事と HN の URL に置き換える（元記事の本文を取得できていないページ・元記事が HN 自身のページは HN の URL だけ）。
 終了コード: 0 結果を出力できた / 1 それ以外
 """
 
@@ -38,11 +41,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import os
 import re
 import subprocess
 import sys
+import urllib.request
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
@@ -131,11 +136,77 @@ RATE_LIMITED_RE = re.compile(r"RATE_?LIMIT|RateLimit", re.I)
 QUOTA_RE = re.compile(r"quota|limit|上限|exhaust", re.I)
 YOUTUBE_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([\w-]{11})")
 
+HN_SUMMARY_RE = re.compile(r"^https?://hn-summary\.k-ui\.jp/items/(\d+)")
+URL_RE = re.compile(r"^https?://\S+$")
+
 T = TypeVar("T")
 
 
 def progress(msg: str) -> None:
     print(f"[audio_overview] {msg}", file=sys.stderr, flush=True)
+
+
+# --- 入力からソースへ -----------------------------------------------------------------
+
+
+def sources_from_input(text: str) -> list[dict]:
+    """--input の文字列（URL を空白区切りで並べたもの）をソースにする。URL 以外が混ざっていたら止める。"""
+    tokens = text.split()
+    if not tokens:
+        raise ValueError("--input に URL がありません")
+    rest = [t for t in tokens if not URL_RE.match(t)]
+    if rest:
+        raise ValueError(f"--input には URL だけを渡す（地の文や要望があるときは --spec を使う）: {' '.join(rest)[:200]}")
+    return [{"type": "youtube" if YOUTUBE_ID_RE.search(t) else "url", "url": t} for t in tokens]
+
+
+def hn_summary_links(page: str, item_id: str) -> tuple[list[str], str | None]:
+    """hn-summary のページから、ソースにする URL（元記事と HN）と、元記事を外した理由を返す。"""
+    hn = f"https://news.ycombinator.com/item?id={item_id}"
+    m = re.search(r'href="([^"]+)"[^>]*>\s*元記事', page)
+    article = html.unescape(m[1]) if m else None
+    if "元記事の本文を取得できなかった" in page:
+        return [hn], "hn-summary が元記事の本文を取得できていない"
+    if not article:
+        return [hn], "元記事のリンクが見つからない"
+    if "news.ycombinator.com" in article:
+        return [hn], None
+    return [article, hn], None
+
+
+def expand_sources(sources: list[dict]) -> tuple[list[dict], list[dict]]:
+    """hn-summary のページを、そこに載っている元記事と HN の URL に置き換える（ページ自身はソースにしない）。
+
+    渡されたページがいくつあっても、すべて同じ1つのノートブックのソースになる。
+    """
+    out: list[dict] = []
+    report: list[dict] = []
+    for s in sources:
+        m = HN_SUMMARY_RE.match(s.get("url") or "")
+        if not m:
+            out.append(s)
+            continue
+        entry: dict = {"page": s["url"]}
+        try:
+            req = urllib.request.Request(s["url"], headers={"User-Agent": "notebooklm-audio-overview"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                page = r.read().decode("utf-8", "replace")
+            urls, note = hn_summary_links(page, m[1])
+        except OSError as e:
+            urls, note = [f"https://news.ycombinator.com/item?id={m[1]}"], f"ページを取得できない: {e}"
+        entry["urls"] = urls
+        if note:
+            entry["note"] = note
+        report.append(entry)
+        out.extend({"type": "url", "url": u} for u in urls)
+    seen: set[str] = set()
+    deduped = []
+    for s in out:
+        k = s.get("url") or json.dumps(s, ensure_ascii=False, sort_keys=True)
+        if k not in seen:
+            seen.add(k)
+            deduped.append(s)
+    return deduped, report
 
 
 def now_iso() -> str:
@@ -872,16 +943,26 @@ def main(argv: list[str]) -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--spec")
+    given = ap.add_mutually_exclusive_group()
+    given.add_argument("--input", help="ユーザーの入力（URL を空白区切りで並べたもの）をそのまま渡す。全部で1つのノートブックになる")
+    given.add_argument("--spec")
     ap.add_argument("--adopt", action="store_true", help="音声概要の無い既存ノートブックもジョブに登録して処理する")
     ap.add_argument("--retry", action="store_true", help="生成に失敗したジョブも残っているジョブに戻して処理する")
     args = ap.parse_args(argv)
+    expanded: list[dict] = []
     try:
-        spec = jobs.parse_json_arg(args.spec) if args.spec else None
+        if args.input is not None:
+            spec = {"sources": sources_from_input(args.input), "options": {}}
+        else:
+            spec = jobs.parse_json_arg(args.spec) if args.spec else None
+        if spec is not None:
+            spec["sources"], expanded = expand_sources(spec.get("sources", []))
         out = asyncio.run(run(spec, args.adopt, args.retry))
     except Exception as e:  # noqa: BLE001
         print(json.dumps({"fatal": error_text(e)}, ensure_ascii=False))
         return 1
+    if expanded:
+        out["expanded"] = expanded
     print(json.dumps(out, ensure_ascii=False))
     return 0
 
